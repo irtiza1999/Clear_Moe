@@ -1,4 +1,4 @@
-# CLEAR-MoE++: Calibration-Driven Layer-Selective Expert Extraction from Pretrained Vision Transformers
+# CLEAR-MoE++ Project
 
 ## Project Overview
 
