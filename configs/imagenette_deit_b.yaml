@@ -1,0 +1,52 @@
+# CLEAR-MoE++ — DeiT-Base on ImageNette
+
+model:
+  name: deit_base_patch16_224
+  source: timm
+  pretrained: true
+  num_classes: 10
+  input_size: 224
+
+data:
+  task: classification
+  dataset: imagenette
+  data_dir: data/imagenette/imagenette2-320
+  calib_size: 500
+  val_batch_size: 4
+  num_workers: 4
+  pin_memory: true
+
+extraction:
+  num_experts: 4
+  layer_selection: last_half
+  method: clear_moe
+  shared_basis_rank: null
+
+router:
+  type: linear
+  hidden_dim: 64
+  lr: 1.0e-3
+  epochs: 5
+  weight_decay: 0.01
+  scheduler: cosine
+  balance_coeff: 0.01
+
+runtime:
+  dtype: float32
+  routing: top1
+  route_sorting: true
+  dispatch_backend: grouped
+
+evaluation:
+  metrics: [top1, top5, accuracy_retention, active_params, ffn_macs, latency_p50, latency_p90, throughput]
+  latency_warmup: 10
+  latency_iterations: 50
+
+seed: 42
+output_dir: outputs
+device: cuda
+
+lambda_comm: 0.1
+lambda_hot: 0.1
+path_penalty_coeff: 0.01
+expert_counts: [2, 4, 8]

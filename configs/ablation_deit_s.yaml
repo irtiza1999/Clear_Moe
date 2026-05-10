@@ -1,0 +1,36 @@
+# Ablation grid configuration for DeiT-Small
+# Used by scripts/14_ablation_runner.py
+
+axes:
+  - name: layer_strategy
+    values: [last_half, score_top_k, all_layers, alternating]
+
+  - name: expert_count
+    values: [2, 4, 8, 16]
+
+  - name: basis_rank
+    values: [8, 16, 32, 64, 128]
+
+  - name: router_depth
+    values: [0, 1, 2]
+
+  - name: calib_size
+    values: [50, 200, 500, 2000]
+
+  - name: moe_architecture
+    values: [flat_hard, hmoe, soft, elastic]
+
+# Fixed parameters for all cells
+fixed:
+  model: deit_small_patch16_224
+  E: 4
+  strategy: last_half
+  dispatch: grouped
+
+# Paths needed by cells (fill in after running scripts 02-04)
+extra_args:
+  activations_dir: "outputs/logs/activations_deit_small_patch16_224_classification_E4_clear_moe_calib50/activations"
+  scores_file: "outputs/logs/scores_deit_small_patch16_224_classification_E4_clear_moe_calib50_last_half/layer_scores.json"
+  extraction_dir: "outputs/logs/extraction_deit_small_patch16_224_classification_E4_clear_moe_calib50_E4_fc2_v2/expertized_layers"
+
+output_dir: outputs/ablations

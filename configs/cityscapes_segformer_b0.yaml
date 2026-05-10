@@ -1,0 +1,51 @@
+# CLEAR-MoE++ — SegFormer-B0 on Cityscapes segmentation
+
+model:
+  name: nvidia/segformer-b0-finetuned-cityscapes-512-1024
+  source: transformers
+  pretrained: true
+
+data:
+  task: segmentation
+  dataset: cityscapes
+  data_dir: data/cityscapes
+  calib_size: 200
+  val_batch_size: 2
+  num_workers: 2
+  pin_memory: true
+  image_size: [512, 512]
+  num_classes: 19
+
+extraction:
+  num_experts: 4
+  layer_selection: last_half
+  method: clear_moe
+  shared_basis_rank: null
+
+router:
+  type: linear
+  hidden_dim: 64
+  lr: 1.0e-3
+  epochs: 5
+  weight_decay: 0.01
+  scheduler: cosine
+  balance_coeff: 0.01
+
+runtime:
+  dtype: float32
+  routing: top1
+  route_sorting: true
+  dispatch_backend: grouped
+
+evaluation:
+  metrics: [miou, pixel_accuracy, accuracy_retention, latency_p50, latency_p90, throughput]
+  latency_warmup: 5
+  latency_iterations: 20
+
+seed: 42
+output_dir: outputs
+device: cuda
+
+lambda_comm: 0.1
+lambda_hot: 0.1
+path_penalty_coeff: 0.01

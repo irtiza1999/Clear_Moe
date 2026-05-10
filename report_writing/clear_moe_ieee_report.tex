@@ -1,0 +1,276 @@
+﻿% CLEAR-MoE++ IEEE Conference Report (EDA and Prototype)
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{pgfplots}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,arrows.meta,positioning,backgrounds,calc}
+\pgfplotsset{compat=1.18}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{balance}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{listings}
+
+\definecolor{codegray}{rgb}{0.95,0.95,0.95}
+\definecolor{codecomment}{rgb}{0.4,0.4,0.4}
+\definecolor{codestring}{rgb}{0.18,0.40,0.12}
+\definecolor{codekeyword}{rgb}{0.10,0.10,0.65}
+
+\lstdefinestyle{pysmall}{
+  backgroundcolor=\color{codegray},
+  commentstyle=\color{codecomment}\itshape,
+  keywordstyle=\color{codekeyword}\bfseries,
+  stringstyle=\color{codestring},
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  breakatwhitespace=true,
+  captionpos=b,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{gray!40},
+  language=Python,
+  showspaces=false,
+  showstringspaces=false,
+  tabsize=4,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=4pt,
+  xleftmargin=12pt,
+}
+\lstset{style=pysmall}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{CLEAR-MoE++: Calibration-Driven Layer-Selective Expert Extraction\\
+from Pretrained Dense Vision Backbones\\
+{\normalsize Project Report: EDA and Prototype}}
+
+\author{
+\IEEEauthorblockN{Md.\ Irtiza Hossain}
+\IEEEauthorblockA{
+\textit{Dept.\ of Computer Science and Engineering}\\
+Student ID: 20101481\\
+md.irtiza.hossain@g.bracu.ac.bd}
+}
+
+\maketitle
+
+\begin{abstract}
+This project documents the exploratory data analysis (EDA) pipeline and proof-of-concept prototype for CLEAR-MoE++, a post-training expert extraction framework for conditional compute in vision models. The EDA phase validates data integrity by identifying 80 corrupt or duplicate images, detects outliers via Isolation Forest, and visualizes representation structure with PCA and t-SNE. The prototype decomposes feed-forward network layers via truncated SVD and k-means into shared low-rank bases plus residual experts. On Imagenette with DeiT-Small and Cityscapes with SegFormer-B0 at $512\times512$, Soft-MoE and Elastic-MoE variants preserve the dense baseline accuracy, demonstrating feasibility without retraining.
+\end{abstract}
+
+\begin{IEEEkeywords}
+mixture of experts, vision transformer, post-training extraction, exploratory data analysis, conditional compute
+\end{IEEEkeywords}
+
+\section{Introduction}
+Vision transformers execute FFN sub-layers uniformly for every token, regardless of semantic content. Sparse MoE architectures can reduce FLOPs via selective routing, but usually require expensive pretraining. This project explores post-training extraction by converting a pretrained dense backbone into a conditional MoE backbone without retraining.
+
+\textbf{Objectives:} implement a reproducible EDA pipeline; validate FFN layer clusterability; prototype a four-phase extraction pipeline; demonstrate accuracy preservation; and document the process on consumer hardware.
+
+\section{Related Work}
+The paper by MoEfication~\cite{zhang2022} shows FFN clustering without retraining. 
+As demonstrated by AdaMV-MoE~\cite{chen2023}, routing is more beneficial in later layers. 
+PCA and t-SNE~\cite{pearson1901,vanderm2008} examine the learned representations, 
+and Isolation Forest~\cite{liu2008} provides powerful outlier detection.
+
+\section{Dataset and EDA}
+
+\textbf{Datasets:} Imagenette contains 13,394 images across 10 classes, while 
+Cityscapes consists of 5,000 urban scene images with 19 categories.
+
+\textbf{EDA Pipeline:} 
+(1) Integrity checks using SHA-256 deduplication and PIL validation detect duplicates and corrupted files; 
+(2) Isolation Forest with 2\% contamination flags anomalies; 
+(3) PCA and t-SNE expose class separability; and 
+(4) PSI, Jensen--Shannon Divergence, and clustering diagnostics quantify distribution and separability.
+
+\textbf{Data Integrity:} 
+A total of 13,276 clean images remain after removing 118 images (near-duplicates: 11 pairs; corrupt: 107). 
+The train/validation split is 9,391/3,885 samples (see Table~\ref{tab:eda-summary}).
+
+\textbf{Analysis of Feature Space:} 
+The activation magnitude ranges from [0.187, 0.312], and the Frobenius norms of the blocks range from [95.4, 122.6]. 
+Truncated SVD analysis shows that the top-10 singular values capture 67.8\% of the representation energy, 
+while a rank-192 approximation captures 99.2\%, justifying the chosen extraction rank. 
+The mean cosine similarity among class centers ranges from 0.312 to $-0.085$, indicating moderate inter-class separation.
+
+\textbf{Distribution Stability:} 
+Intra-split analysis (train vs.\ validation) yields PSI = 0.043, JSD = 0.018, and Kolmogorov--Smirnov $p = 0.05$, 
+indicating no significant data leakage. 
+Inter-dataset shift (vs.\ CIFAR-100) shows PSI = 0.287, JSD = 0.112, and Wasserstein distance = 0.189, 
+suggesting domain shift but manageable differences. 
+Figure~1 illustrates class balance across splits, while Figure~2 shows the domain gap via PCA projections.
+
+\textbf{Conceptual Quality:} 
+The Davies--Bouldin index (1.24), Silhouette coefficient (0.542), 
+Calinski--Harabasz index (287.3), and class purity (0.876) indicate strong class separability, 
+supporting expert clustering. 
+The ten Imagenette classes are well-separated in both PCA and t-SNE spaces (Figure~\ref{fig:eda-visuals}). 
+Figure~\ref{fig:imagenette-samples} presents representative samples, which include object-centric images 
+such as fish, dogs, tools, buildings, and sports equipment.
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.48\columnwidth}
+\centering
+\includegraphics[width=\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/val_pca.pdf}
+\caption{Validation PCA projection.}
+\label{fig:val-pca}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\columnwidth}
+\centering
+\includegraphics[width=\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/val_tsne.pdf}
+\caption{Validation t-SNE projection.}
+\label{fig:val-tsne}
+\end{subfigure}
+\caption{Validation set representation space projections.}
+\label{fig:eda-visuals}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}[t]{0.48\columnwidth}
+\centering
+\includegraphics[width=\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/train_class_distribution.pdf}
+\caption{Train class distribution.}
+\label{fig:train-dist}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\columnwidth}
+\centering
+\includegraphics[width=\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/val_class_distribution.pdf}
+\caption{Validation class distribution.}
+\label{fig:val-dist}
+\end{subfigure}
+\caption{Class-wise sample counts and balance analysis.}
+\label{fig:class-dist}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}[t]{0.48\columnwidth}
+\centering
+\includegraphics[width=\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/train_pca.pdf}
+\caption{Training PCA projection.}
+\label{fig:train-pca}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\columnwidth}
+\centering
+\includegraphics[width=\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/external_pca.pdf}
+\caption{CIFAR-100 PCA projection (comparison).}
+\label{fig:external-pca}
+\end{subfigure}
+\caption{PCA analysis: Imagenette training set and external dataset (CIFAR-100).}
+\label{fig:pca-compare}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.98\columnwidth]{figures/imagenette_samples_grid.pdf}
+\caption{Representative Imagenette sample images after cleaning and deduplication.}
+\label{fig:imagenette-samples}
+\end{figure}
+
+\section{Prototype Design}
+
+The four-phase pipeline (Figure~\ref{fig:pipeline}) is summarized below.
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Calibration:} 200 images feed FFN activations through hooks.
+\item \textbf{Scoring:} $\mathcal{S}(l) = 0.3\,\text{sparsity} + 0.4\,\text{clusterability} - 0.3\,\text{sensitivity}$ selects the top 50\% of blocks.
+\item \textbf{Extraction:} SVD with rank $r=192$ and k-means with $E=4$ decompose $W_2 = W_{\text{shared}} + \sum_e W_e^{\text{res}}$.
+\item \textbf{Deployment:} a linear router is trained for 5 epochs and used with softmax expert blending at inference.
+\end{enumerate}
+
+\textbf{Reconstruction error:} blocks 6--11 remain in the 0.47--0.52 range, which is acceptable for the prototype stage.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.98\columnwidth]{figures/clear_moe_pipeline_modern.pdf}
+\caption{CLEAR-MoE++ prototype overview.}
+\label{fig:pipeline}
+\end{figure}
+
+\section{Preliminary Results}
+
+Classification results on Imagenette are shown in Table~\ref{tab:imagenette-results}. Soft-MoE and Elastic-MoE variants preserve 99.53\% accuracy while reducing latency from 12.56~ms to 10.64--10.85~ms compared to the dense baseline.
+
+\begin{table}[h]
+\caption{Imagenette results for DeiT-Small with $E=4$.}
+\centering
+\scriptsize
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{Acc.} & \textbf{Latency (ms)} \\
+\midrule
+Dense & 99.53\% & 12.56 \\
+Soft-MoE & 99.53\% & 10.85 \\
+Elastic ($t=0.2$) & 99.53\% & 10.64 \\
+\bottomrule
+\end{tabular}
+\label{tab:imagenette-results}
+\end{table}
+
+EDA metrics and prototype validation statistics are summarized in Table~\ref{tab:eda-summary}.
+
+\begin{table}[h]
+\caption{EDA summary and prototype status.}
+\centering
+\scriptsize
+\begin{tabular}{p{0.46\columnwidth}p{0.40\columnwidth}}
+\toprule
+\textbf{Item} & \textbf{Value} \\
+\midrule
+Retained images & 13,276 \\
+Removed images & 118 \\
+Train/val split & 9,391/3,885 \\
+Intra-split PSI & 0.043 \\
+Silhouette coeff. & 0.542 \\
+Class purity & 0.876 \\
+SegFormer-B0 mIoU & 57.57\% \\
+Accuracy retention & 100\% \\
+\bottomrule
+\end{tabular}
+\label{tab:eda-summary}
+\end{table}
+
+\textbf{Segmentation:} On Cityscapes with SegFormer-B0 at $512\times512$, dense and CLEAR-MoE both achieve 57.57\% mIoU (Table~\ref{tab:eda-summary}), indicating full accuracy retention in the prototype.
+
+\section{Discussion}
+
+\textbf{EDA findings:} Isolation Forest effectively flags outliers, while the cleaned data keeps strong class structure in PCA and t-SNE space.
+
+\textbf{Prototype validation:} The classification and segmentation runs preserve baseline accuracy, supporting the viability of post-training extraction.
+
+\textbf{Limitations:} the current prototype uses a single GPU, consumer-scale datasets, standard PyTorch dispatch, and no multi-GPU optimization.
+
+\textbf{Next Steps:} Extend the pipeline to ViT-B, incorporate fused routing kernels, and conduct a more comprehensive ablation study once the work progresses beyond the prototype phase.
+
+\begin{thebibliography}{00}
+\bibitem{zhang2022} Z. Zhang et al., ``MoEfication,'' ACL 2022.
+\bibitem{chen2023} Y. Chen et al., ``AdaMV-MoE,'' ICCV 2023.
+\bibitem{pearson1901} K. Pearson, ``On lines and planes of closest fit,'' Phil. Mag. 1901.
+\bibitem{vanderm2008} L. van der Maaten and G. Hinton, ``Visualizing data using t-SNE,'' JMLR 2008.
+\bibitem{liu2008} F. Liu et al., ``Isolation Forest,'' IEEE ICDM 2008.
+\end{thebibliography}
+
+\end{document}

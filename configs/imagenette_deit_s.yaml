@@ -1,0 +1,61 @@
+# CLEAR-MoE++ — DeiT-Small on ImageNette (fast iteration config)
+# Optimized for GTX 960 (2-4GB VRAM), single GPU
+
+model:
+  name: deit_small_patch16_224
+  source: timm
+  pretrained: true
+  num_classes: 10
+  input_size: 224
+
+data:
+  task: classification
+  dataset: imagenette
+  data_dir: data/imagenette/imagenette2-320
+  calib_size: 500
+  val_batch_size: 8
+  num_workers: 4
+  pin_memory: true
+
+extraction:
+  num_experts: 4
+  layer_selection: last_half
+  method: clear_moe
+  shared_basis_rank: null
+
+router:
+  type: linear
+  hidden_dim: 64
+  lr: 1.0e-3
+  epochs: 5
+  weight_decay: 0.01
+  scheduler: cosine
+  balance_coeff: 0.01
+  adaptive_routing: false
+  confidence_threshold: 0.6
+
+runtime:
+  dtype: float32
+  routing: top1
+  route_sorting: true
+  dispatch_backend: grouped  # naive | grouped | stream | triton | cublas_gemm
+
+evaluation:
+  metrics: [top1, top5, accuracy_retention, active_params, ffn_macs, latency_p50, latency_p90, throughput]
+  latency_warmup: 10
+  latency_iterations: 50
+
+seed: 42
+output_dir: outputs
+device: cuda
+
+# v3 ablation fields
+router_types: [top1, top2, expert_choice, comm_aware, path_consistent, self_routing, shared_expert]
+bucket_modes: [none, expert_sort, group_sort, latent_bucket]
+hot_expert_policies: [none, overflow_dense, shadow_replica]
+runtime_backends: [naive, grouped, stream, triton, cublas_gemm]
+parallel_modes: [serial, ep2, ep4, pp2, ep2_pp2, ep2_stream]
+lambda_comm: 0.1
+lambda_hot: 0.1
+path_penalty_coeff: 0.01
+expert_counts: [2, 4, 8]

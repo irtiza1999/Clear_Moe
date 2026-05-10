@@ -1,0 +1,56 @@
+# CLEAR-MoE Configuration — DeiT-Small on Preprocessed Imagenette
+# Using the output from the latest EDA run
+
+model:
+  name: deit_small_patch16_224
+  source: timm
+  pretrained: true
+  num_classes: 1000
+  input_size: 224
+
+data:
+  task: classification
+  dataset: imagenette
+  data_dir: outputs/eda_preprocess/eda_20260506_161503/dataset_preprocessed
+  calib_size: 2000
+  val_batch_size: 4
+  num_workers: 2
+  pin_memory: true
+
+extraction:
+  num_experts: 4
+  layer_selection: last_half
+  method: clear_moe
+  shared_basis_rank: null
+
+router:
+  type: linear
+  lr: 1.0e-3
+  epochs: 5
+  weight_decay: 0.01
+  scheduler: cosine
+  balance_coeff: 0.01
+  adaptive_routing: false
+
+runtime:
+  dtype: float32
+  routing: top1
+  route_sorting: true
+
+evaluation:
+  metrics:
+    - top1
+    - top5
+    - accuracy_retention
+    - active_params
+    - ffn_macs
+    - latency_p50
+    - latency_p90
+    - throughput
+    - energy_per_image
+  latency_warmup: 10
+  latency_iterations: 50
+
+seed: 42
+output_dir: outputs/full_runs
+device: cuda

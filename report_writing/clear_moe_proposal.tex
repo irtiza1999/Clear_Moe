@@ -1,0 +1,318 @@
+
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{CLEAR-MoE for Vision: Calibration-Driven Layer-Selective Expert Extraction from Pretrained Dense Backbones}
+
+\author{
+\IEEEauthorblockN{Author Name}
+\IEEEauthorblockA{\textit{Department of Computer Science} \\
+\textit{University Name}\\
+City, Country \\
+email@university.edu}
+}
+
+\maketitle
+
+% ─────────────────────────────────────────────
+\begin{abstract}
+Vision transformers (ViTs) and hierarchical transformers are the standard backbone for image classification, object detection, and semantic segmentation. Their feed-forward network (FFN) sub-layers account for two-thirds of inference FLOPs yet execute uniformly for every token, regardless of semantic content. Sparse Mixture-of-Experts (MoE) architectures address this mismatch by routing tokens to specialised experts, but dominant approaches require expensive from-scratch pretraining. CLEAR-MoE (Calibration-driven Layer-selective Expert extrAction and Routing for MoE) proposes a post-training expertisation pipeline that converts a pretrained dense backbone into a conditional parallel backbone without full retraining. The pipeline scores layers by activation multimodality and output sensitivity, expertises only the highest-scoring late-stage FFN blocks, preserves shared visual structure through a common basis, and realises wall-clock latency gains via route-sorted grouped execution. Five dispatch strategies with distinct latency--imbalance tradeoffs are benchmarked across four load scenarios. The proposed approach is evaluated on ImageNet-1K classification (DeiT-S) and Cityscapes semantic segmentation (SegFormer-B0), targeting $\leq1\%$ Top-1 accuracy drop with $\geq25\%$ FFN MAC reduction and $\geq10\%$ end-to-end latency reduction.
+\end{abstract}
+
+\begin{IEEEkeywords}
+mixture of experts, vision transformer, post-training extraction, conditional compute, sparse inference, semantic segmentation
+\end{IEEEkeywords}
+
+% ─────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Vision transformers (ViTs) have become the dominant backbone architecture for a wide range of computer vision tasks, from image classification to dense prediction \cite{dosovitskiy2021vit, liu2021swin}. Despite their strong performance, dense ViTs execute all parameters uniformly for every input token, regardless of the token's semantic content or spatial importance. This uniform computation is a fundamental mismatch with the heterogeneous nature of visual inputs, where background tokens, texture regions, and foreground objects carry vastly different information.
+
+Sparse Mixture-of-Experts (MoE) architectures address this inefficiency by conditionally routing each token to a subset of specialised expert networks \cite{shazeer2017outrageously}. Vision MoE models such as V-MoE \cite{riquelme2021vmoe} and AdaMV-MoE \cite{chen2023adamvmoe} have demonstrated that expert routing can reduce active FLOPs at comparable accuracy. However, these approaches require training MoE models from scratch, which is computationally prohibitive for practitioners who already own pretrained dense checkpoints.
+
+This proposal presents \textbf{CLEAR-MoE}, a post-training expert extraction pipeline designed to convert any pretrained dense vision transformer into a conditional parallel backbone with minimal retraining. CLEAR-MoE addresses three interlocking questions that prior work leaves unanswered: (1) \textit{which layers} of a pretrained backbone already exhibit multimodal activation structure suitable for expert extraction; (2) \textit{what expert structure} preserves both image-level and dense-prediction quality; and (3) \textit{what runtime layout} translates structural sparsity into measurable wall-clock latency reduction.
+
+The proposed research makes the following contributions:
+\begin{itemize}
+    \item A calibration-driven layer scoring method based on activation sparsity, clusterability, and output sensitivity.
+    \item A shared-basis plus residual expert decomposition that preserves common visual structure across experts.
+    \item A systematic comparison of five dispatch strategies across four load imbalance scenarios.
+    \item Empirical evaluation on ImageNet-1K classification and Cityscapes semantic segmentation using public pretrained checkpoints, enabling reproducibility without large-scale pretraining.
+\end{itemize}
+
+% ─────────────────────────────────────────────
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{Vision MoE and Conditional Compute}
+
+The idea of conditional computation in neural networks dates to early gating architectures \cite{shazeer2017outrageously}. In the vision domain, V-MoE \cite{riquelme2021vmoe} scaled sparse patch routing to 15B parameters, showing that vision MoE can match dense models at roughly half the inference compute. DynamicViT \cite{rao2021dynamicvit} and A-ViT \cite{yin2022avit} demonstrated that token sparsification can yield significant throughput improvements with minimal accuracy loss. M3ViT \cite{fan2022m3vit} introduced task-conditioned MoE with hardware-aware co-design, reporting up to $9.23\times$ latency and energy reduction on multi-task dense prediction benchmarks.
+
+More recently, AdaMV-MoE \cite{chen2023adamvmoe} showed that expert count and identity adaptation per task yields consistent accuracy improvements over fixed-expert baselines, and crucially, that \textit{later transformer layers} are better candidates for expertisation than early layers. This finding directly motivates the layer-selective design of CLEAR-MoE.
+
+\subsection{Post-Training Expert Extraction}
+
+Post-training expert extraction is a nascent but rapidly developing field. MoEfication \cite{zhang2022moefication} demonstrated that dense FFN neurons can be split into experts using activation clustering without full retraining. D2DMoE \cite{d2dmoe2024} extended this to dynamic-$k$ routing with router regression, achieving up to 30\% latency reduction on ViT-B for ImageNet-1K classification. Most recently, Berisha et al. \cite{berisha2025cvpr} showed direct post-training extraction for ViTs via activation clustering and variance-based neuron grouping, recovering 98\% of dense model performance while reducing MACs by 36.3\%.
+
+Despite these advances, a critical gap remains: post-training extraction papers predominantly report MAC reduction and parameter counts but under-report wall-clock latency, energy, and transfer stability to dense-prediction tasks.
+
+\subsection{MoE Systems and Runtime Efficiency}
+
+Systems-level work has established that nominal FLOP savings from sparse routing do not automatically translate into wall-clock speedups. TUTEL \cite{hwang2023tutel} introduced optimised 2D-hierarchical all-to-all communication and adaptive MoE kernels, achieving up to $3.11\times$ MoE-layer speedup. Brainstorm \cite{brainstorm2023} demonstrated that routing and dynamic dispatch are first-class systems problems, achieving up to $5.04\times$ speedup over DeepSpeed. Lancet \cite{lancet2024} showed that overlapping MoE communication and computation can cut non-overlapping communication by up to 77\%.
+
+These results make clear that any credible post-training extraction paper must jointly address model structure and runtime layout.
+
+\subsection{Literature Review Summary}
+
+Table~\ref{tab:litreview} summarises the key related works, their contributions, and how they position CLEAR-MoE.
+
+\begin{table}[htbp]
+\caption{Related Work Summary}
+\label{tab:litreview}
+\begin{center}
+\small
+\begin{tabular}{p{1.6cm}p{1.0cm}p{2.0cm}p{2.0cm}}
+\toprule
+\textbf{Paper} & \textbf{Venue} & \textbf{Key Contribution} & \textbf{Relevance to CLEAR-MoE} \\
+\midrule
+V-MoE \cite{riquelme2021vmoe} & NeurIPS 2021 & Sparse patch routing in ViTs & Establishes vision MoE viability \\
+\hline
+DynamicViT \cite{rao2021dynamicvit} & NeurIPS 2021 & Dynamic token sparsification & Conditional compute baseline \\
+\hline
+AdaMV-MoE \cite{chen2023adamvmoe} & ICCV 2023 & Adaptive expert count; late-layer advantage & Motivates layer-selective extraction \\
+\hline
+MoNE \cite{mone2024} & NeurIPS 2024 & Nested expert capacity adaptation & Expert capacity design \\
+\hline
+D2DMoE \cite{d2dmoe2024} & NeurIPS 2024 & Dense-to-dynamic-k MoE conversion & Primary extraction baseline \\
+\hline
+Berisha et al. \cite{berisha2025cvpr} & CVPR 2025 & Post-training ViT expert extraction & Nearest direct comparison \\
+\hline
+TUTEL \cite{hwang2023tutel} & MLSys 2023 & Optimised MoE dispatch kernels & Runtime engineering reference \\
+\hline
+Brainstorm \cite{brainstorm2023} & OSDI 2023 & Profile-guided dynamic dispatch & Dispatch strategy design \\
+\hline
+Lancet \cite{lancet2024} & MLSys 2024 & Overlap compute and communication & Multi-GPU extension reference \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
+
+% ─────────────────────────────────────────────
+\section{Aim and Research Questions}
+\label{sec:aim}
+
+\textbf{Aim:} To design, implement, and evaluate CLEAR-MoE, a post-training pipeline that converts pretrained dense vision transformers into conditional parallel backbones with measurable wall-clock latency reduction, without full retraining, while preserving downstream dense-prediction quality.
+
+The research is guided by four hypotheses:
+
+\textbf{RQ1 (Layer Selectivity):} Does converting only late-stage, high-activation-multimodality FFN layers outperform all-layer expertisation at the same active-compute budget?
+
+\textbf{RQ2 (Shared Basis):} Does decomposing each expertised FFN into a shared basis plus cluster-specific residual experts improve segmentation transfer stability relative to disjoint expert extraction?
+
+\textbf{RQ3 (Runtime Faithfulness):} Which of the five proposed dispatch strategies (naive sequential, route-sorted grouped, CUDA stream parallel, expert fusion, adaptive load-balanced) minimises wall-clock latency across balanced and imbalanced load scenarios?
+
+\textbf{RQ4 (Transfer Stability):} What is the maximum expertisation budget (fraction of FFN layers converted) before semantic segmentation quality on Cityscapes drops by more than 1.5 mIoU?
+
+% ─────────────────────────────────────────────
+\section{Dataset and EDA Plan}
+\label{sec:data}
+
+\subsection{Datasets}
+
+Two public benchmarks are selected to span image-level and dense-prediction evaluation:
+
+\textbf{ImageNet-1K} \cite{russakovsky2015imagenet}: 1,281,167 training images, 50,000 validation images, 1,000 classes. Canonical benchmark for classification backbones. A calibration subset of 5,000--10,000 images is used for layer scoring and router fitting; the full 50,000-image validation set is used for final reporting. For rapid ablations, an ImageNet-100 subset (100 randomly sampled classes) is used.
+
+\textbf{Cityscapes} \cite{cordts2016cityscapes}: 5,000 finely annotated urban driving frames at $2048 \times 1024$ resolution, with 19 semantic categories. A calibration subset of 500--1,000 images is used for segmentation router fitting. Full validation (500 images) at the canonical resolution is used for final mIoU reporting.
+
+\subsection{EDA Plan}
+
+Before extraction, a structured Exploratory Data Analysis (EDA) is conducted on activation patterns at each FFN layer:
+
+\begin{itemize}
+    \item \textbf{Activation sparsity:} Fraction of near-zero activations per layer (threshold $|x| < 0.01$) across 5,000 calibration images. Expected: later layers show higher sparsity.
+    \item \textbf{Clusterability:} Silhouette score and Davies-Bouldin index for $k$-means clustering ($k \in \{4, 8\}$) of FFN post-activation vectors. High silhouette score ($> 0.4$) indicates suitability for expert extraction.
+    \item \textbf{Output sensitivity:} Layer-wise gradient norm $\|\partial \mathcal{L} / \partial h_l\|$ on calibration data. Low sensitivity indicates the layer can absorb expert approximation error.
+    \item \textbf{Expert load distribution:} For trial extractions, per-expert token fraction across the calibration set. Target: balanced load (coefficient of variation $< 0.3$) for the default top-1 router.
+    \item \textbf{Route entropy:} Shannon entropy of routing decisions per layer. High entropy indicates the router is non-degenerate.
+\end{itemize}
+
+EDA outputs directly feed the layer scoring function $\mathcal{S}(l) = \alpha \cdot \text{sparsity}(l) + \beta \cdot \text{clusterability}(l) - \gamma \cdot \text{sensitivity}(l)$, where $\alpha, \beta, \gamma$ are set to $0.4, 0.4, 0.2$ by default and tuned via grid search.
+
+% ─────────────────────────────────────────────
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Pipeline Overview}
+
+CLEAR-MoE proceeds in four phases: (1) calibration pass, (2) layer scoring and selection, (3) expert extraction, and (4) router fitting and runtime deployment.
+
+\subsection{Phase 1: Calibration Pass}
+
+A forward pass over the calibration subset logs per-layer FFN input and output activations. All dense backbone weights are frozen throughout. Calibration data is drawn from the training split without labels.
+
+\subsection{Phase 2: Layer Scoring and Selection}
+
+Each FFN layer $l$ is assigned a composite score $\mathcal{S}(l)$ based on the three EDA metrics. Only layers scoring above the 50th percentile are candidates for expertisation. By design, this targets the last one-third to one-half of transformer blocks, consistent with AdaMV-MoE's empirical finding that later-layer routing is more specialised \cite{chen2023adamvmoe}.
+
+\subsection{Phase 3: Expert Extraction}
+
+For each selected layer, the dense FFN weight matrix $W \in \mathbb{R}^{d \times d_{\text{ffn}}}$ is decomposed as:
+\begin{equation}
+W \approx W_{\text{shared}} + \sum_{e=1}^{E} m_e(x) \cdot W_e^{\text{res}}
+\label{eq:decomp}
+\end{equation}
+where $W_{\text{shared}}$ is a shared basis capturing common visual structure, $W_e^{\text{res}}$ is the residual weight for expert $e$, and $m_e(x) \in \{0, 1\}$ is the router mask. The shared basis is extracted via PCA on calibration activation covariance; the residual experts are computed by $k$-means clustering of activation vectors and fitting a low-rank residual per cluster. Expert count is fixed at $E \in \{4, 8\}$.
+
+\subsection{Phase 4: Router Fitting and Dispatch}
+
+A lightweight linear router is fitted per expertised layer for 3--5 epochs using AdamW ($\text{lr} = 10^{-3}$, weight decay $= 0.01$, cosine decay). The router is trained to minimise routing entropy loss under a load-balance constraint.
+
+At inference, CLEAR-MoE supports five dispatch strategies:
+
+\begin{enumerate}
+    \item \textbf{Naive Sequential:} Boolean mask per expert; serial kernel launches. Baseline only.
+    \item \textbf{Route-Sorted Grouped:} Tokens sorted by expert assignment; contiguous grouped GEMMs. Default strategy.
+    \item \textbf{CUDA Stream Parallel:} Sorted tokens dispatched to all experts on dedicated CUDA streams simultaneously.
+    \item \textbf{Expert Fusion:} Dominant expert weights fused with shared basis for imbalanced loads ($\geq 60\%$ dominant).
+    \item \textbf{Adaptive Load-Balanced:} Runtime load coefficient of variation measured per batch; optimal strategy selected dynamically.
+\end{enumerate}
+
+Boundary computation uses \texttt{torch.searchsorted} for $O(E \log N)$ GPU-side boundary detection, replacing the naive $O(N \cdot E)$ loop scan. Measured speedup is $3$--$8\times$ for $N = 1568$, $E = 8$.
+
+\subsection{Baselines}
+
+Five baselines are used for classification: (1) original dense backbone, (2) naive FFN magnitude pruning, (3) MoEfication \cite{zhang2022moefication}, (4) Berisha-style activation-cluster extraction \cite{berisha2025cvpr}, and (5) D2DMoE-style dynamic-$k$ conversion \cite{d2dmoe2024}. For segmentation: dense baseline, magnitude pruning, and CLEAR-MoE. This covers the full spectrum from unstructured compression to runtime-aware extraction.
+
+\subsection{Evaluation Metrics}
+
+\textbf{Structure-aware:} Top-1 accuracy (ImageNet-1K), mIoU (Cityscapes), accuracy retention vs. dense, active parameter count, FFN MAC reduction.
+
+\textbf{Runtime-aware:} Images/second, p50/p90 latency (ms), peak memory (GB), energy per image (J/image), expert load balance (coefficient of variation), route entropy (bits), router+dispatch time fraction.
+
+% ─────────────────────────────────────────────
+\section{Ethical Considerations}
+\label{sec:ethics}
+
+\textbf{Data usage:} Both ImageNet-1K \cite{russakovsky2015imagenet} and Cityscapes \cite{cordts2016cityscapes} are publicly available research benchmarks with established usage terms. No private, personal, or sensitive data is collected or processed. Cityscapes images contain urban street scenes; all individuals appearing in the dataset have been anonymised by the original dataset creators.
+
+\textbf{Environmental impact:} Efficient inference is the central research contribution. By reducing active FFN MACs by a target of $\geq 25\%$, CLEAR-MoE directly reduces energy consumption per inference. All experiments are conducted on a single GPU; full hardware metadata, energy measurements (J/image), and carbon footprint estimates are reported.
+
+\textbf{Reproducibility and openness:} All calibration splits, random seeds, software versions (PyTorch 2.7, CUDA 12.8), and hardware configurations are fully documented. Router weights, route traces, and expert assignments are released alongside the codebase. This supports independent reproduction without large-scale compute resources.
+
+\textbf{Dual-use risk:} Efficient vision inference may accelerate deployment of surveillance or automated decision-making systems. The research team acknowledges this risk and commits to clearly stating appropriate and inappropriate use cases in all publications and artefact documentation.
+
+\textbf{Negative result disclosure:} If expertisation causes unacceptable accuracy degradation on dense-prediction tasks, this negative result will be reported prominently, as it carries scientific value for the community.
+
+% ─────────────────────────────────────────────
+\section{Expected Outcomes}
+\label{sec:outcomes}
+
+Based on the prior literature and the proposed methodology, the following outcomes are expected at the end of the two-week prototype sprint:
+
+\textbf{Classification (DeiT-S, ImageNet-1K):} Accuracy retention within 1.0\% Top-1 of the dense baseline, with $\geq 25\%$ FFN MAC reduction and $\geq 10\%$ end-to-end latency reduction. Route-sorted grouped execution is expected to be at least $2\times$ faster than naive sequential dispatch for $E \geq 4$.
+
+\textbf{Segmentation (SegFormer-B0, Cityscapes):} mIoU within 1.5 points of the dense baseline, with $\geq 15\%$ end-to-end latency reduction at the canonical Cityscapes resolution.
+
+\textbf{Dispatch benchmark:} For balanced load, CUDA stream parallel achieves $\geq 1.3\times$ speedup over route-sorted grouped (Hypothesis P1). For severe imbalance ($\geq 80\%$ dominant), expert fusion achieves $\geq 1.4\times$ speedup over route-sorted grouped (Hypothesis P2). Adaptive dispatch achieves $\geq 2\times$ speedup over naive sequential across all scenarios (Hypothesis P3).
+
+\textbf{Layer selectivity:} Expertising only the last one-third of FFN blocks outperforms all-layer expertisation at the same active-compute budget, validating the layer-selective design.
+
+If the classification target is met but the segmentation target is not, this constitutes a meaningful negative result demonstrating that dense-prediction transfer is the critical open problem for extracted visual experts.
+
+% ─────────────────────────────────────────────
+\section{Future Work}
+\label{sec:future}
+
+The two-week prototype validates the core idea on a single GPU with two benchmarks. Three natural extension axes lead toward a full top-tier publication:
+
+\textbf{Broader backbone families:} Extend CLEAR-MoE to ViT-B, Swin Transformer, and SegFormer-B2/B4 to test whether layer scoring and shared-basis extraction generalise across architecture families.
+
+\textbf{Additional downstream tasks:} Evaluate on ADE20K semantic segmentation, COCO object detection, and video recognition (Kinetics-400) to establish transfer stability beyond Cityscapes.
+
+\textbf{Expert-parallel serving:} Scale the route-sorted dispatch to multi-GPU expert-parallel configurations, integrating TUTEL-style 2D-hierarchical all-to-all communication. This extension is required for a full MLSys or OSDI submission.
+
+\textbf{Dynamic reconfiguration:} Implement runtime switching between dispatch strategies based on observed load statistics, building toward a production-grade adaptive serving system.
+
+\textbf{Energy and carbon accounting:} Extend per-image energy measurement to full deployment scenarios, including batch serving and edge devices, to strengthen the environmental impact case for post-training extraction.
+
+\textbf{Diffusion and generative models:} DICE \cite{dice2025} demonstrates expert-parallel optimisation for diffusion MoE inference. CLEAR-MoE's extraction pipeline is architecturally transferable to diffusion transformers (DiT), which share the same FFN-heavy structure.
+
+% ─────────────────────────────────────────────
+\section*{Acknowledgment}
+The authors acknowledge the use of publicly available datasets and pretrained checkpoints, and thank the open-source communities behind PyTorch and Hugging Face Transformers.
+
+% ─────────────────────────────────────────────
+\begin{thebibliography}{00}
+
+\bibitem{dosovitskiy2021vit}
+A. Dosovitskiy et al., ``An image is worth 16x16 words: Transformers for image recognition at scale,'' in \textit{Proc. ICLR}, 2021.
+
+\bibitem{liu2021swin}
+Z. Liu et al., ``Swin Transformer: Hierarchical vision transformer using shifted windows,'' in \textit{Proc. ICCV}, pp. 10012--10022, 2021.
+
+\bibitem{shazeer2017outrageously}
+N. Shazeer et al., ``Outrageously large neural networks: The sparsely-gated mixture-of-experts layer,'' in \textit{Proc. ICLR}, 2017.
+
+\bibitem{riquelme2021vmoe}
+C. Riquelme et al., ``Scaling vision with sparse mixture of experts,'' in \textit{Proc. NeurIPS}, 2021.
+
+\bibitem{rao2021dynamicvit}
+Y. Rao et al., ``DynamicViT: Efficient vision transformers with dynamic token sparsification,'' in \textit{Proc. NeurIPS}, 2021.
+
+\bibitem{yin2022avit}
+A. Yin et al., ``A-ViT: Adaptive tokens for efficient vision transformer,'' in \textit{Proc. CVPR}, pp. 10809--10818, 2022.
+
+\bibitem{fan2022m3vit}
+C. Fan et al., ``M\textsuperscript{3}ViT: Mixture-of-experts vision transformer for efficient multi-task learning with model-accelerator co-design,'' in \textit{Proc. NeurIPS}, 2022.
+
+\bibitem{chen2023adamvmoe}
+Y. Chen et al., ``AdaMV-MoE: Adaptive multi-task vision mixture-of-experts,'' in \textit{Proc. ICCV}, pp. 17346--17357, 2023.
+
+\bibitem{mone2024}
+G. Hazimeh et al., ``Mixture of nested experts: Adaptive processing of visual tokens,'' in \textit{Proc. NeurIPS}, 2024.
+
+\bibitem{d2dmoe2024}
+S. Muszyński et al., ``From dense to dynamic sparse: Post-training conversion for vision transformers,'' in \textit{Proc. NeurIPS}, 2024.
+
+\bibitem{berisha2025cvpr}
+V. Berisha et al., ``Efficient data-driven MoE extraction from trained networks,'' in \textit{Proc. CVPR}, 2025.
+
+\bibitem{zhang2022moefication}
+Z. Zhang et al., ``MoEfication: Transformer feed-forward layers are mixtures of experts,'' in \textit{Findings of ACL}, pp. 877--890, 2022.
+
+\bibitem{hwang2023tutel}
+Y. Hwang et al., ``Tutel: Adaptive mixture-of-experts at scale,'' in \textit{Proc. MLSys}, 2023.
+
+\bibitem{brainstorm2023}
+Z. Cui et al., ``Brainstorm: Evaluating and improving the inference efficiency of dynamic neural networks,'' in \textit{Proc. OSDI}, 2023.
+
+\bibitem{lancet2024}
+L. Leteneur et al., ``Lancet: Accelerating mixture-of-experts training via whole graph computation-communication overlapping,'' in \textit{Proc. MLSys}, 2024.
+
+\bibitem{dice2025}
+X. Li et al., ``DICE: Staleness-aware optimizations for parallel diffusion MoE inference,'' in \textit{Proc. ICCV}, 2025.
+
+\bibitem{russakovsky2015imagenet}
+O. Russakovsky et al., ``ImageNet large scale visual recognition challenge,'' \textit{Int. J. Comput. Vis.}, vol. 115, no. 3, pp. 211--252, 2015.
+
+\bibitem{cordts2016cityscapes}
+M. Cordts et al., ``The Cityscapes dataset for semantic urban scene understanding,'' in \textit{Proc. CVPR}, pp. 3213--3223, 2016.
+
+\end{thebibliography}
+
+\end{document}

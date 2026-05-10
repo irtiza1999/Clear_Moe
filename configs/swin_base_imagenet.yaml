@@ -1,0 +1,66 @@
+# CLEAR-MoE Configuration — Swin-Base on ImageNet Classification
+
+model:
+  name: swin_base_patch4_window7_224
+  source: timm
+  pretrained: true
+  num_classes: 1000
+  input_size: 224
+
+data:
+  task: classification
+  dataset: imagenette
+  calib_size: 1000            # Smaller calib for 88M model on GTX 960
+  val_batch_size: 1
+  num_workers: 2
+  pin_memory: true
+
+extraction:
+  num_experts: 4
+  layer_selection: last_half
+  top_k: null
+  threshold: null
+  method: clear_moe
+  shared_basis_rank: null
+
+router:
+  type: linear
+  hidden_dim: 64
+  lr: 1.0e-3
+  epochs: 5
+  weight_decay: 0.01
+  scheduler: cosine
+  balance_coeff: 0.01
+  adaptive_routing: false
+  confidence_threshold: 0.6
+
+runtime:
+  dtype: float32
+  routing: top1
+  route_sorting: true
+
+evaluation:
+  metrics:
+    - top1
+    - top5
+    - accuracy_retention
+    - active_params
+    - ffn_macs
+    - latency_p50
+    - latency_p90
+    - throughput
+    - energy_per_image
+  latency_warmup: 10
+  latency_iterations: 50
+
+seed: 42
+output_dir: outputs
+device: cuda
+
+expert_counts: [2, 4, 8, 16]
+basis_ranks: [8, 16, 32, 64]
+calib_sizes: [50, 200, 500, 2000]
+router_depths: [0, 1, 2]
+dispatch_strategies: [naive, grouped, stream, fusion, adaptive, triton, cublas_gemm]
+parallelism_modes: [cpu_serial, cpu_mt, gpu_single, ep2, dp2, pp2]
+moe_architectures: [flat_hard, hmoe, soft, elastic]

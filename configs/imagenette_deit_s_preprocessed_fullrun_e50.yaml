@@ -1,0 +1,64 @@
+# CLEAR-MoE++ - DeiT-Small on ImageNette (preprocessed full pipeline retraining, 50 epochs)
+
+model:
+  name: deit_small_patch16_224
+  source: timm
+  pretrained: true
+  num_classes: 10
+  input_size: 224
+
+data:
+  task: classification
+  dataset: imagenette
+  data_dir: outputs/eda_preprocess/eda_20260424_163952/dataset_preprocessed
+  calib_size: 500
+  val_batch_size: 8
+  num_workers: 4
+  pin_memory: true
+
+extraction:
+  num_experts: 4
+  layer_selection: last_half
+  method: clear_moe
+  shared_basis_rank: null
+
+router:
+  type: linear
+  hidden_dim: 64
+  lr: 1.0e-3
+  epochs: 50
+  weight_decay: 0.01
+  scheduler: cosine
+  balance_coeff: 0.01
+  adaptive_routing: false
+  confidence_threshold: 0.6
+
+runtime:
+  dtype: float32
+  routing: top1
+  route_sorting: true
+  dispatch_backend: grouped
+
+evaluation:
+  metrics: [top1, top5, accuracy_retention, active_params, ffn_macs, latency_p50, latency_p90, throughput]
+  latency_warmup: 10
+  latency_iterations: 50
+
+seed: 42
+output_dir: outputs/full_runs/preprocessed_fullrun_20260424_e50
+device: cuda
+
+training:
+  early_stopping: false
+  min_epochs: 50
+
+preprocessing:
+  selected_split: official
+  remove_exact_duplicates: true
+  remove_outliers: intersection_of_zscore_and_iforest
+  normalization:
+    name: imagenet_default
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  resize_interpolation: lanczos
+  imbalance_remedy: class_weighted_loss
