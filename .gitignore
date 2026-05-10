@@ -123,23 +123,8 @@ runtime/*.pyc
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# Report writing aux files (keep PDFs and .tex)
-report_writing/*.aux
-report_writing/*.bbl
-report_writing/*.blg
-report_writing/*.fdb_latexmk
-report_writing/*.fls
-report_writing/*.log
-report_writing/*.out
-report_writing/*.synctex.gz
-report_writing/*.toc
-report_writing/compile*.log
-report_writing/figures/
-
-# Keep source files
-!report_writing/*.tex
-!report_writing/*.pdf
-!report_writing/*.cls
+# Report writing (do not add to Git)
+report_writing/
 
 # System
 .git/

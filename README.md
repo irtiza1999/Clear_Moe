@@ -6,6 +6,8 @@ CLEAR-MoE++ is a post-training expert extraction pipeline that converts pretrain
 
 **Data Policy:** This repository does not include raw datasets. Download Imagenette and Cityscapes locally using the helper scripts in `datasets/` before running the pipeline.
 
+**Code Repository:** The source code for this project is available at https://github.com/irtiza1999/Clear_Moe.
+
 **Key Results:**
 - **Classification (DeiT-Small on Imagenette):** 86.51% Top-1 accuracy (99.8% of dense baseline 86.69%)
 - **Active Parameter Reduction:** 42.18% fewer parameters with top-1 routing
