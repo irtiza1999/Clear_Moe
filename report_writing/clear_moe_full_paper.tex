@@ -1,1081 +1,409 @@
-
 \documentclass[conference]{IEEEtran}
 \IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+%Template version as of 6/27/2024
+
 \usepackage{cite}
 \usepackage{amsmath,amssymb,amsfonts}
-\usepackage{algpseudocode}
+\usepackage{algorithmic}
 \usepackage{algorithm}
 \usepackage{graphicx}
 \usepackage{textcomp}
 \usepackage{xcolor}
+% Additional packages required for this paper
 \usepackage{booktabs}
 \usepackage{array}
-\usepackage{tabularx}
 \usepackage{multirow}
-\usepackage{pgfplots}
-\usepackage{tikz}
-\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds, calc}
-\pgfplotsset{compat=1.18}
+% pgfplots/tikz removed — figures now generated as PDF via Python scripts
 \usepackage{hyperref}
 \usepackage{url}
 \usepackage{balance}
-\usepackage{placeins}
+\usepackage{enumitem}
+\usepackage{pifont}
+\usepackage{flafter}   % floats always appear after first reference
+\usepackage{placeins}  % provides \FloatBarrier
+\usepackage{float}     % enables [H] exact-placement specifier
 
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 
 \begin{document}
 
-\title{CLEAR-MoE++: Efficient Expert Extraction\\
-from Pretrained Vision Transformers}
-
-\author{
-\IEEEauthorblockN{Md. Irtiza Hossain}
-\IEEEauthorblockA{\textit{Department of Computer Science and Engineering}\\
-Dhaka, Bangladesh \\
-md.irtiza.hossain@g.bracu.ac.bd\\
-Student ID: 20101481}
-}
+\title{CLEAR-MoE: Shared-Basis Expert Extraction from Frozen Vision Transformers via Calibration-Driven Layer Selection}
 
 \maketitle
 
-%─────────────────────────────────────────────────────────────────────────────
+%───────────────────────────────────────────────────────────────────────────────────
 \begin{abstract}
-Modern image-recognition networks called \emph{vision transformers} (ViTs) process every image patch with the same amount of computation regardless of whether the patch contains a background sky or a salient object boundary. This uniformity is wasteful: real images are semantically heterogeneous, yet two-thirds of all inference arithmetic is spent in the \emph{feed-forward network} (FFN) sub-layers that execute identically for every input token. \emph{Sparse Mixture-of-Experts} (MoE) architectures correct this by routing each token to only a small subset of specialised sub-networks (``experts''), but existing MoE vision models require training from scratch---an impractical barrier for practitioners with pretrained checkpoints. We present \textbf{CLEAR-MoE++}, a post-training pipeline that converts any frozen pretrained ViT into a sparse-compute MoE backbone in four phases: (1) score every FFN layer by its \emph{activation multimodality} and \emph{output sensitivity} using a small calibration set; (2) decompose only the highest-scoring late-stage layers into a shared low-rank basis (via truncated SVD) plus cluster-specific residual experts (via $k$-means), preserving common visual structure; (3) fit lightweight token routers; (4) deploy inference through seven router variants and six GPU dispatch backends. Three novel modules are contributed: \textbf{ALFRouter}---an auxiliary-loss-free router that achieves load-balanced expert assignment without a manually tuned penalty term; \textbf{stream\_fine}---a fine-grained CUDA stream executor for overlapping expert computation; and \textbf{DisaggregatedSim}---a module that precisely measures the PCIe round-trip cost of disaggregated CPU-router + GPU-expert inference. On Imagenette (DeiT-Small, $E{=}4$ experts), CLEAR-MoE achieves 86.51\% Top-1 accuracy (99.8\% of the dense baseline 86.69\%) with a 42.18\% reduction in active parameters. SegFormer-B0 extraction on Cityscapes preserves the dense mIoU of 0.5757. cuBLAS batched-GEMM dispatch achieves 249,775 tokens/second---an 18.63$\times$ speedup over CPU-serial execution. DisaggregatedSim measures a PCIe round-trip penalty of 5.04 ms per batch (net transfer cost $\Delta{=}3.08$ ms above co-located serial), confirming that interconnect latency---not expert computation---bottlenecks disaggregated inference. Roofline analysis confirms that dispatch engineering, not expert GEMM optimisation, yields the greatest end-to-end latency return on bandwidth-limited hardware.
+We present \textbf{CLEAR-MoE}, a four-phase post-training pipeline that converts a frozen pretrained vision transformer (ViT) into a sparse mixture-of-experts (MoE) model without updating backbone weights. The pipeline (i)~scores FFN layers by sparsity, clusterability, and output sensitivity; (ii)~decomposes selected layers into a shared low-rank SVD basis plus per-cluster residual experts ($k$-means); (iii)~fits lightweight routers supervised by cluster labels; and (iv)~dispatches tokens via pluggable CUDA backends. On Imagenette with DeiT-Small, CLEAR-MoE retains 99.9\% of dense accuracy (86.70\,$\pm$\,0.02\% vs.\ 86.73\%). Our ablations isolate a consistent empirical finding: the shared SVD basis is the dominant accuracy-preserving component. Random routing, learned routing, and three router architectures yield numerically similar results spanning at most 0.06\,pp (86.62--86.68\%), and accuracy remains stable across SVD rank, expert count $E \in \{2,\ldots,8\}$, calibration size $N\in\{50,\ldots,500\}$, and random seed. This finding generalizes across five ViT backbones (DeiT-T/S/B, ViT-S/B, 5.7M--86.6M parameters), with $|\Delta|{\leq}0.10$\,pp across all configurations. On a GTX\,960, routing and scatter-gather overhead make CLEAR-MoE FFN 1.3--1.7$\times$ slower than dense. A dispatch microbenchmark indicates that routing (AI\,=\,1.9\,FLOPs/B) is an order of magnitude more memory-bound than expert GEMMs (AI\,=\,22.7), identifying fused dispatch kernels as a plausible optimization target.
 \end{abstract}
 
 \begin{IEEEkeywords}
-mixture of experts, vision transformer, post-training extraction, conditional compute, sparse inference, semantic segmentation, dispatch strategies, roofline analysis, expert parallelism, PCIe overhead
+mixture of experts, vision transformer, post-training extraction, shared basis decomposition, calibration-driven scoring, dispatch strategies, roofline analysis
 \end{IEEEkeywords}
 
-\noindent\textbf{Code Availability:} All source code and experiments are available at \url{https://github.com/irtiza1999/Clear_Moe}.
-
-%─────────────────────────────────────────────────────────────────────────────
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 \section{Introduction}
 \label{sec:intro}
 
-\subsection{Background: Vision Transformers and the Uniform-Compute Problem}
+Vision transformers (ViTs) \cite{dosovitskiy2021vit} devote roughly two-thirds of inference FLOPs to feed-forward network (FFN) sub-layers that execute the same MLP computation for every token, regardless of semantic content \cite{riquelme2021vmoe}. Sparse mixture-of-experts (MoE) architectures \cite{shazeer2017outrageously} address this by routing each token to a subset of specialized sub-networks, reducing active compute proportional to $k/E$. However, existing vision MoE models \cite{riquelme2021vmoe,chen2023adamvmoe} require training from scratch, which is a resource barrier for practitioners who already hold a pretrained checkpoint.
 
-A \emph{vision transformer} (ViT) \cite{dosovitskiy2021vit} divides an input image into a regular grid of non-overlapping $16{\times}16$-pixel patches, embeds each patch as a $d$-dimensional vector (a \emph{token}), and processes all tokens jointly through $L$ stacked \emph{transformer blocks}. Each block contains two sub-layers: a \emph{multi-head self-attention} (MHSA) layer that computes pairwise interactions between tokens, and a \emph{feed-forward network} (FFN) that applies a two-layer MLP independently to each token. For a $224{\times}224$ image this produces $T = 196$ tokens; a standard 12-block DeiT-Small runs $196 \times 12 = 2{,}352$ FFN evaluations per image---all identical in structure regardless of whether the token is a featureless background region or an object edge.
+\emph{Post-training expert extraction} converts a dense FFN into experts without retraining \cite{zhang2022moefication,d2dmoe2024,berisha2025cvpr}. Despite recent progress, three gaps remain: (1)~most methods convert all FFN layers, ignoring sensitivity variation across depth; (2)~disjoint expert assignment discards shared low-level structure, destabilizing downstream transfer; (3)~speedup claims are reported in MACs rather than wall-clock latency on real hardware.
 
-The FFN accounts for approximately \textbf{two-thirds of all inference FLOPs} in standard ViT architectures \cite{riquelme2021vmoe}, yet executes uniform computation for semantically heterogeneous tokens. This is the \emph{uniform-compute problem}: the network devotes the same arithmetic to easy and hard tokens alike.
+CLEAR-MoE addresses all three with the following contributions:
 
-\subsection{Sparse MoE as a Solution}
+\begin{itemize}[leftmargin=*,noitemsep]
+\item \textbf{Calibration-driven layer scoring}: composite score $\mathcal{S}(l) = 0.4\,\text{sparsity} + 0.4\,\text{clusterability} - 0.2\,\text{sensitivity}$ selects FFN layers that cluster well and tolerate perturbation, automatically excluding high-sensitivity layers (e.g., block~0, sensitivity~$=$~0.946).
 
-\emph{Sparse Mixture-of-Experts} (MoE) \cite{shazeer2017outrageously} replaces each uniform FFN with $E$ specialised sub-networks (\emph{experts}). A lightweight \emph{router} (gating network) examines each token and selects only the top-$k$ most relevant experts to process it, leaving the rest idle. The computational benefit is proportional to $k/E$: routing to 1 of 4 experts reduces active FFN compute by up to 75\%. Critically, different experts can specialise for different visual concepts (textures, edges, object classes), improving the effective parameter utilisation.
+\item \textbf{Shared-basis decomposition}: fc2 is decomposed into a shared truncated-SVD basis plus per-cluster residuals; fc1 is shared identically across all experts. This preserves common visual structure while allowing per-cluster specialization.
 
-Vision MoE models including V-MoE \cite{riquelme2021vmoe} and AdaMV-MoE \cite{chen2023adamvmoe} have demonstrated that expert routing can halve active inference FLOPs with negligible accuracy loss. However, these systems are trained from scratch---requiring enormous compute resources unavailable to practitioners with an existing pretrained checkpoint.
+\item \textbf{Hardware-transparent latency study}: all timing on a single GTX\,960 (4\,GB, 112\,GB/s) with \texttt{cuda.synchronize()}-fenced p50 reporting (100 forward passes), indicating that routing overhead (not expert arithmetic) is a likely bottleneck.
 
-\subsection{Post-Training Extraction: Gaps}
-
-\emph{Post-training expert extraction} converts a pretrained dense FFN into experts without retraining \cite{zhang2022moefication,d2dmoe2024,berisha2025cvpr}. Despite recent progress, three critical gaps remain:
-
-\begin{enumerate}
-\item \textbf{Layer selectivity}: prior methods expertise all FFN layers or a fixed fraction, ignoring the empirical finding that later transformer layers form more specialised representations \cite{chen2023adamvmoe} and thus benefit more from expert routing.
-\item \textbf{Shared structure}: disjoint extraction assigns the entire FFN weight matrix to independent experts, discarding common visual structure (e.g., low-level edge detectors shared across all experts) and destabilising transfer to dense prediction tasks like semantic segmentation.
-\item \textbf{Runtime faithfulness}: most extraction papers report reduced MAC (multiply-accumulate operation) counts---a theoretical measure---without demonstrating that structural sparsity translates into wall-clock latency reduction on real hardware.
-\end{enumerate}
-
-\subsection{CLEAR-MoE++: Contributions}
-
-\textbf{CLEAR-MoE++} addresses all three gaps with the following contributions:
-
-\begin{itemize}
-\item \textbf{Calibration-driven layer scoring} $\mathcal{S}(l) = \alpha \cdot \text{sparsity}(l) + \beta \cdot \text{clusterability}(l) - \gamma \cdot \text{sensitivity}(l)$---selects only the most expertisable FFN blocks based on measured activation statistics.
-\item \textbf{Shared-basis plus residual expert decomposition} (truncated SVD + $k$-means)---preserves common visual structure in a shared weight component while allocating cluster-specific residuals to individual experts.
-\item \textbf{Seven router variants} spanning linear gates, MLP gates, expert-choice routing, communication-aware routing, path-consistent routing, self-routing, and the novel ALFRouter.
-\item \textbf{Six dispatch backends} (Naive, Grouped, Stream, Stream\_fine, Triton, cuBLAS) benchmarked across four token-load imbalance scenarios to identify real-hardware winners.
-\item \textbf{Three novel runtime modules}: ALFRouter, stream\_fine, and DisaggregatedSim with explicit PCIe overhead measurement.
-\item \textbf{24-cell ablation} and roofline analysis quantifying the compute vs.\ memory bottleneck of every pipeline component.
+\item \textbf{Comprehensive ablation}: decomposition (D0--D8), layer selection (L0--L10), dispatch backends, expert count, SVD rank, router architecture, calibration size, and random seed, establishing which design choices actually matter.
 \end{itemize}
 
-%─────────────────────────────────────────────────────────────────────────────
-\section{Background and Related Work}
-\label{sec:background}
+\noindent\textbf{Scope.} All measured results use a single GTX\,960. No claims are made about data-center GPUs, distributed setups, or larger datasets. Multi-device throughput projections are modelled analytically using PCIe Gen3$\times$16 bandwidth; no NCCL runs were performed.
 
-\subsection{Key Terminology}
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+\section{Related Work}
+\label{sec:related}
 
-Table~\ref{tab:glossary} defines the domain-specific terms used throughout this paper.
+\textbf{Post-training expert extraction.} MoEfication \cite{zhang2022moefication} first showed that clustering neuron activation patterns partitions a pretrained FFN into experts without retraining. D2DMoE \cite{d2dmoe2024} extended this to dynamic-$k$ routing, achieving 30\% latency reduction on an A100 for ViT-B/ImageNet-1K. Berisha et al.\ \cite{berisha2025cvpr} used variance-based neuron grouping to recover 98\% of dense performance with 36.3\% MAC reduction for DeiT-B. CLEAR-MoE differs by (a)~selecting layers via a composite sensitivity-aware score, (b)~preserving shared structure via SVD decomposition, and (c)~providing a full wall-clock dispatch study on consumer hardware. Table~\ref{tab:priorwork} positions these methods side-by-side. Sparse Upcycling \cite{komatsuzaki2023sparse} converts dense language-model checkpoints to MoE by cloning FFN weights and training a load-balancing router via continued pre-training; unlike CLEAR-MoE, backbone weights are updated, requiring gradient access and sufficient unlabelled data.
 
-\begin{table}[htbp]
-\caption{Glossary of Key Terms}
-\label{tab:glossary}
+\begin{table}[!t]
+\caption{Post-training MoE extraction: method comparison. $\dagger$ = MAC reduction (not wall-clock). $\ddagger$ = minimal fine-tuning reported by original paper. CLEAR-MoE: zero backbone weight updates.}
+\label{tab:priorwork}
 \centering
 \small
-\renewcommand{\arraystretch}{1.0}
+\setlength{\tabcolsep}{2.5pt}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{p{2.2cm}p{5.2cm}}
+\begin{tabular}{lllrrp{2.2cm}}
 \toprule
-\textbf{Term} & \textbf{Definition} \\
+\textbf{Method} & \textbf{Backbone} & \textbf{HW} & \textbf{Acc.\ Ret.} & \textbf{Latency} & \textbf{Expert Struct.} \\
 \midrule
-Token & A single image patch embedded as a $d$-dimensional vector; 196 tokens per $224{\times}224$ image with $16{\times}16$ patches \\
-FFN & Feed-forward network sub-layer in each transformer block; a two-layer MLP applied independently to each token \\
-FLOPs & Floating-point operations; a hardware-independent measure of arithmetic workload \\
-Expert & A weight matrix that processes only a subset of tokens; experts specialise for different visual patterns \\
-Router / Gate & A lightweight network that maps each token to a probability distribution over experts and selects the top-$k$ \\
-MoE layer & A transformer FFN replaced by $E$ experts plus a router; only $k{<}E$ experts activate per token \\
-Top-1 Accuracy & Fraction of test images where the model's single highest-confidence prediction matches the ground-truth label \\
-Top-5 Accuracy & Fraction of images where the correct label appears in the model's top-5 predictions \\
-mIoU & Mean Intersection-over-Union; standard segmentation metric---IoU per class averaged over all classes \\
-p50 Latency & Median (50th-percentile) latency over many repeated runs; robust to outliers \\
-Throughput & Processing rate; images/second (img/s) or tokens/second (tok/s) \\
-Arithmetic Intensity & FLOPs divided by bytes of memory accessed; high AI = compute-bound, low AI = memory-bound \\
-Roofline & Model plotting achievable performance vs.\ arithmetic intensity; reveals hardware bottleneck \\
-Ridge Point & AI value where compute ceiling equals memory-bandwidth ceiling; divides regimes \\
-PCIe & PCI Express bus; the electrical interconnect between CPU RAM and GPU VRAM; transfers data at up to 16 GB/s (Gen3 ×16) \\
-SVD & Singular Value Decomposition; factorises a matrix as $W = U\Sigma V^\top$; truncated SVD keeps only the top-$r$ components \\
-$k$-means & Unsupervised clustering algorithm; partitions $N$ data points into $k$ clusters by minimising within-cluster variance \\
-Calibration set & Small set of representative inputs used to measure model statistics without any weight updates \\
-CUDA Stream & An ordered queue of GPU operations; multiple streams enable concurrent GPU kernel execution \\
-cuBLAS & NVIDIA's optimised dense linear-algebra library; \texttt{torch.bmm} dispatches to it for batched matrix multiplication \\
-Triton & Python-based GPU kernel compiler (OpenAI); allows writing fused GPU kernels in Python \\
+MoEfication \cite{zhang2022moefication}  & ViT  & N/A       & $\sim$99\%     & N/A                 & Disjoint $k$-means \\
+D2DMoE \cite{d2dmoe2024}$^{\ddagger}$    & ViT-B/16 & A100  & $\sim$99\%     & $-$30\%             & Dynamic-$k$ disjoint \\
+Berisha \cite{berisha2025cvpr}$^{\ddagger}$ & DeiT-B & N/A  & 98\%           & $-$36.3\%$\dagger$  & Variance-based disjoint \\
+\textbf{CLEAR-MoE (ours)}               & \textbf{DeiT-T/S/B, ViT-S/B} & \textbf{GTX\,960} & \textbf{99.9\%} & $+$1.3--1.7$\times$ & \textbf{Shared SVD + residuals} \\
 \bottomrule
+\multicolumn{6}{l}{\footnotesize D2DMoE latency on A100 (2\,TB/s); CLEAR-MoE on GTX\,960 (112\,GB/s). Bandwidth 18$\times$ lower.}
 \end{tabular}
 }
 \end{table}
 
-\subsection{Vision Mixture-of-Experts}
+\textbf{Vision MoE training.} V-MoE \cite{riquelme2021vmoe} demonstrated that sparse patch routing matches dense quality at $\sim$50\% active compute for 15B-parameter ViTs. AdaMV-MoE \cite{chen2023adamvmoe} showed late transformer layers benefit most from expertization, a heuristic our composite score can override when sensitivity signals contradict it. DynamicViT \cite{rao2021dynamicvit} and A-ViT \cite{yin2022avit} achieve token-level sparsification via halting gates, complementary to our FFN-level approach.
 
-V-MoE \cite{riquelme2021vmoe} first applied sparse token routing to 15B-parameter ViTs, matching dense accuracy at $\sim$50\% active inference compute. DynamicViT \cite{rao2021dynamicvit} and A-ViT \cite{yin2022avit} showed token sparsification yields 38--62\% throughput improvement at sub-0.5\% accuracy cost. AdaMV-MoE \cite{chen2023adamvmoe} established that \emph{later} transformer layers benefit most from expertisation because early layers learn universally useful low-level features while late layers encode task-specific semantics---directly motivating CLEAR-MoE++'s layer-selective design.
+\textbf{MoE runtime systems.} TUTEL \cite{hwang2023tutel} achieves 3.11$\times$ speedup via 2D all-to-all on 128 GPUs. Brainstorm \cite{brainstorm2023} shows profile-guided dispatch yields 5$\times$ speedup over DeepSpeed for SwinV2-MoE. Lancet \cite{lancet2024} reduces non-overlapping communication by 77\% via whole-graph overlap. These systems target high-bandwidth multi-GPU clusters; CLEAR-MoE studies the single-consumer-GPU regime where bandwidth is 18$\times$ lower.
 
-\subsection{Post-Training Expert Extraction}
 
-MoEfication \cite{zhang2022moefication} was the first to demonstrate that a pretrained dense FFN can be partitioned into experts by clustering its neurons based on activation patterns---without any retraining. D2DMoE \cite{d2dmoe2024} extended this with dynamic-$k$ routing, achieving 30\% latency reduction on an A100 GPU for ViT-B on ImageNet-1K. Berisha et al.\ \cite{berisha2025cvpr} used variance-based neuron grouping to recover 98\% of dense performance while reducing MACs by 36.3\% and parameters by 32.4\% for DeiT-B. CLEAR-MoE++ differs from all three by (a) using composite layer scoring rather than treating all layers equally, (b) preserving shared visual structure through SVD-based decomposition, and (c) providing a complete runtime benchmarking study.
-
-\subsection{MoE Runtime Systems}
-
-TUTEL \cite{hwang2023tutel} introduced two-dimensional hierarchical all-to-all communication and adaptive kernel selection, achieving up to 3.11$\times$ MoE-layer speedup on 128 GPUs. Brainstorm \cite{brainstorm2023} demonstrated that profile-guided dispatch optimisation yields up to 5.04$\times$ speedup over DeepSpeed for SwinV2-MoE. Lancet \cite{lancet2024} showed that whole-graph computation-communication overlap reduces non-overlapping communication time by up to 77\%.
-
-\subsection{Literature Summary}
-
-Table~\ref{tab:litreview} positions CLEAR-MoE++ against the most relevant prior work.
-
-\FloatBarrier
-\begin{table}[htbp]
-\caption{Related Work Summary}
-\label{tab:litreview}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{p{1.5cm}p{0.7cm}p{2.1cm}p{2.0cm}}
-\toprule
-\textbf{Work} & \textbf{Venue} & \textbf{Key Contribution} & \textbf{Relation to Ours} \\
-\midrule
-V-MoE \cite{riquelme2021vmoe} & NeurIPS 21 & Sparse patch routing in ViTs & Vision MoE viability baseline \\
-DynamicViT \cite{rao2021dynamicvit} & NeurIPS 21 & Dynamic token sparsification & Conditional compute reference \\
-A-ViT \cite{yin2022avit} & CVPR 22 & Adaptive token halting & Hardware-friendly sparsification \\
-M$^3$ViT \cite{fan2022m3vit} & NeurIPS 22 & Task-conditioned MoE; 9.23$\times$ energy & Energy-aware motivation \\
-Mod-Squad \cite{chen2023modsquad} & CVPR 23 & Modular multi-task experts & Modular design insight \\
-AdaMV-MoE \cite{chen2023adamvmoe} & ICCV 23 & Late-layer advantage; adaptive $k$ & Layer-selective rationale \\
-MoNE \cite{mone2024} & NeurIPS 24 & Nested expert capacity & Capacity-MoE comparison \\
-D2DMoE \cite{d2dmoe2024} & NeurIPS 24 & Dense-to-dynamic-$k$ extraction & Primary extraction baseline \\
-Berisha et al.\ \cite{berisha2025cvpr} & CVPR 25 & Variance-based neuron grouping & Nearest vision extraction \\
-MoEfication \cite{zhang2022moefication} & ACL 22 & Activation-cluster FFN split & Canonical extraction baseline \\
-TUTEL \cite{hwang2023tutel} & MLSys 23 & 2D hierarchical all-to-all & Dispatch engineering reference \\
-Brainstorm \cite{brainstorm2023} & OSDI 23 & Profile-guided dispatch & Dispatch strategy design \\
-Lancet \cite{lancet2024} & MLSys 24 & Compute-communication overlap & Multi-GPU extension reference \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\subsection{Research Questions}
-\label{sec:rq}
-
-\noindent\textbf{RQ1 (Layer Selectivity):} Does expertising only late-stage, high-multimodality FFN layers outperform all-layer expertisation at equal active-compute budget?
-
-\noindent\textbf{RQ2 (Shared Basis):} Does shared-basis plus residual decomposition improve accuracy retention on classification and transfer stability on dense prediction vs.\ disjoint expert extraction?
-
-\noindent\textbf{RQ3 (Runtime Faithfulness):} Which dispatch backend minimises wall-clock latency across balanced and imbalanced token-load scenarios on a consumer GPU?
-
-\noindent\textbf{RQ4 (Transfer Stability):} What is the maximum expertisation budget (layers and experts) before segmentation mIoU degrades beyond 1.5 points?
-
-\noindent\textbf{RQ5 (Novel Modules):} Do ALFRouter, stream\_fine, and DisaggregatedSim produce measurable improvements in routing load balance, inference overlap, and PCIe cost modelling?
-
-%─────────────────────────────────────────────────────────────────────────────
-\section{Datasets, Preprocessing, and Exploratory Analysis}
-\label{sec:data}
-
-\subsection{Datasets}
-
-\textbf{Imagenette} is a publicly available 10-class subset of ImageNet-1K \cite{russakovsky2015imagenet}. The 10 classes (tench, English springer, cassette player, chain saw, church, French horn, garbage truck, gas pump, golf ball, parachute) were chosen to be visually distinct, making accurate classification representative of real-world image recognition. Imagenette is used as the classification benchmark because it provides a reliable proxy for ImageNet-1K performance at substantially reduced computational cost.
-
-\textbf{Cityscapes} \cite{cordts2016cityscapes} contains 5,000 high-resolution ($2048{\times}1024$ px) urban driving frames with fine pixel-level annotations for 19 semantic categories (road, sky, person, car, etc.). It is the standard benchmark for semantic segmentation---the task of assigning a class label to every pixel in an image. Cityscapes is used to evaluate whether expert extraction preserves quality on a structurally different, spatially dense prediction task.
-
-\subsection{Why Two Datasets?}
-
-Classification (Imagenette) tests quality at the \emph{token} level: a single prediction per image. Segmentation (Cityscapes) tests quality at the \emph{pixel} level: 262,144 predictions per image. A good extraction method must preserve both, demonstrating that the shared-basis decomposition does not discard spatially fine-grained visual structure.
-
-\subsection{Preprocessing}
-
-\textbf{Imagenette:} Raw images (13,394 total) were scanned using three complementary anomaly-detection methods:
-\begin{enumerate}
-\item \textbf{SHA-256 exact-hash deduplication}: detects byte-identical image files.
-\item \textbf{Robust z-score filtering} ($\tau{=}3.5$): flags images whose pixel statistics deviate more than 3.5 standard deviations from the class mean---catches corrupted or mislabelled images.
-\item \textbf{Isolation Forest} (contamination rate $= 0.01$): an unsupervised anomaly detector that identifies structurally outlying images in DeiT-Small feature space.
-\end{enumerate}
-Combined filtering removed 118 anomalous images (0.88\% removal rate), yielding 13,276 clean images split into 9,391 training and 3,885 validation images. Standard ImageNet normalisation ($\mu{=}[0.485, 0.456, 0.406]$, $\sigma{=}[0.229, 0.224, 0.225]$) and Lanczos-4 interpolation to $224{\times}224$ are applied throughout.
-
-\textbf{Cityscapes:} A 200-image calibration subset is used for router fitting; 500 validation images are resized to $512{\times}512$ for mIoU evaluation.
-
-\subsection{Exploratory Data Analysis}
-
-\textbf{What EDA checks and why it matters:} Before trusting benchmark results, we must confirm that: (1) no systematic bias exists in the train/test split (distribution shift would make evaluation scores unreliable); (2) the feature space is structured enough for $k$-means clustering (clustering must produce meaningful expert specialisation); (3) the calibration subset (200 images) is representative of the full distribution.
-
-\textbf{Distribution shift analysis:} We extracted DeiT-Small penultimate-layer activations for all 3,885 validation images, forming a feature matrix of shape $3885 \times 384$. Train-test alignment was measured using three statistics: Population Stability Index (PSI), Jensen-Shannon Divergence (JSD), and Kolmogorov-Smirnov (KS) test. PSI $< 0.1$ indicates negligible shift; our measured PSI $= 0.043$ confirms no meaningful train-test distribution shift. JSD $= 0.018$ (close to 0 = identical distributions) and KS $p$-values $> 0.05$ for all 10 classes (failing to reject the null hypothesis of identical distributions) confirm alignment.
-
-\textbf{Clustering quality:} $k$-means with $k{=}10$ (one cluster per class) on validation features yields Silhouette score $= 0.542$ and Davies-Bouldin Index $= 1.24$. The Silhouette score measures how well each point fits its own cluster vs.\ the nearest other cluster ($-1$ to $+1$; higher is better; $> 0.5$ indicates good separation). Davies-Bouldin Index measures average ratio of within-cluster scatter to between-cluster distance (lower is better; $< 1.5$ is considered good). Both confirm that DeiT-Small features form discriminative clusters that will support meaningful expert specialisation.
-
-\textbf{SVD energy concentration:} Top-10 singular values of the $3885{\times}384$ activation matrix capture 67.8\% of cumulative variance. Rank-192 truncation (50th percentile of singular values) retains 99.2\% of total energy---justifying setting the basis rank $r = 192$ as the default for expert extraction.
-
-Table~\ref{tab:dataprep} summarises all preprocessing statistics.
-
-\begin{table}[htbp]
-\caption{Dataset Preprocessing and EDA Summary}
-\label{tab:dataprep}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{p{3.2cm}p{4.2cm}}
-\toprule
-\textbf{Statistic} & \textbf{Value} \\
-\midrule
-Raw Imagenette images & 13,394 \\
-Anomalous images removed & 118 (0.88\%) \\
-Clean train / validation split & 9,391 / 3,885 \\
-Class imbalance (coeff.\ of variation) & 0.087 (mild; corrected by class-weighted loss) \\
-Train-test PSI (Imagenette) & 0.043 ($< 0.1$: negligible shift) \\
-Train-test JSD (Imagenette) & 0.018 (near 0: distributions aligned) \\
-KS test $p$-value & $> 0.05$ all classes (no significant shift) \\
-Imagenette--CIFAR100 PSI & 0.287 ($> 0.1$: OOD confirmed, expected) \\
-$k{=}10$ Silhouette score & 0.542 (good cluster separation) \\
-$k{=}10$ Davies-Bouldin Index & 1.24 (good compactness) \\
-Rank-192 SVD variance retained & 99.2\% \\
-Calibration subset size & 200 images (both tasks) \\
-Cityscapes evaluation resolution & $512{\times}512$ px \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=0.48\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/val_pca.pdf}
-\hfill
-\includegraphics[width=0.48\linewidth]{../outputs/eda_full/eda_20260505_184035/visualizations/val_tsne.pdf}
-\caption{PCA (left) and t-SNE (right) projections of DeiT-Small penultimate-layer features on the cleaned Imagenette validation split (3,885 images, 10 classes, colour-coded). Compact class clusters in both projections confirm that the feature space supports downstream $k$-means clustering for expert specialisation.}
-\label{fig:eda}
-\end{figure}
-
-%─────────────────────────────────────────────────────────────────────────────
-\section{Methodology}
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+\section{Method}
 \label{sec:method}
 
-\subsection{Overview: Four Pipeline Phases}
+CLEAR-MoE converts a frozen pretrained ViT into a selectively expertised model through four sequential phases (Fig.~\ref{fig:pipeline}). No backbone weights are updated.
 
-Fig.~\ref{fig:pipeline} illustrates the four-phase CLEAR-MoE++ pipeline. The core design principle is \textbf{no weight updates on the backbone}: all dense weights remain frozen throughout. Only router parameters (a small linear layer: $384 \times E$ weights) are trained.
-
-\begin{figure}[htbp]
+\begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{../figures/clear_moe_pipeline_real.pdf}
-\caption{CLEAR-MoE++ pipeline. A frozen pretrained backbone produces calibration activations; FFN layers are scored and selectively decomposed into shared basis + residual experts; routers are fitted on cluster labels; inference is deployed through a pluggable dispatch backend.}
+\includegraphics[width=\columnwidth]{../figures/clear_moe_pipeline_real.png}
+\caption{CLEAR-MoE pipeline. A frozen pretrained ViT yields calibration activations; scored FFN layers are decomposed into a shared SVD basis plus per-cluster residual experts; lightweight routers are fitted on $k$-means labels; inference uses pluggable CUDA dispatch backends.}
 \label{fig:pipeline}
 \end{figure}
 
 \subsection{Phase 1: Calibration Pass}
 
-\textbf{What it is:} A calibration pass is a single forward sweep of a small representative dataset through the frozen model, with no loss computation and no weight updates. Its purpose is to \emph{observe} the model's internal activation patterns without modifying it.
-
-\textbf{How it was done:} We registered PyTorch \texttt{forward} hooks on the input of each FFN sub-layer in DeiT-Small. When a batch of images passes through the network, these hooks intercept and save the intermediate activation tensors before they are processed by the FFN. After forwarding all 200 calibration images, we have captured the raw ``pre-FFN'' activations for every layer and every image.
-
-\textbf{Output:} For DeiT-Small (12 FFN layers, 200 images, 196 tokens/image, $d{=}384$): a tensor of shape $[200 \times 196, 384] = [39{,}200, 384]$ per layer---39,200 token vectors of dimension 384. Total stored: 1,815.6 MB across 12 layers.
+Forward $N_\text{cal}$ representative images through the frozen model, recording pre-FFN activation tensors at each of the $L$ selected layers via PyTorch hooks. For DeiT-Small ($d{=}384$, $N_\text{cal}{=}200$, 197 tokens/image), this produces a $[39{,}400,\,384]$ activation matrix per layer.
 
 \subsection{Phase 2: Layer Scoring and Selection}
 
-\textbf{What it is:} Not all FFN layers are equally good candidates for expert extraction. Scoring assigns a number to each layer indicating how suitable it is---layers with high scores are processed into experts; low-scoring layers are left as dense FFNs.
-
-\textbf{The scoring function:}
+Each FFN layer $l$ receives a composite score:
 \begin{equation}
-\mathcal{S}(l) = \alpha \cdot \text{sparsity}(l) + \beta \cdot \text{clusterability}(l) - \gamma \cdot \text{sensitivity}(l)
+\mathcal{S}(l) = 0.4\,\text{sparsity}(l) + 0.4\,\text{clusterability}(l) - 0.2\,\text{sensitivity}(l)
 \label{eq:score}
 \end{equation}
-with $\alpha{=}0.4$, $\beta{=}0.4$, $\gamma{=}0.2$.
+where \emph{sparsity} is the fraction of activation magnitudes below 0.01; \emph{clusterability} is the Silhouette score of $k$-means with $k{=}E$ on the calibration activations; and \emph{sensitivity} is the normalized logit change when the layer's FFN output is zeroed. Sensitivity is \emph{subtracted} because high sensitivity implies high degradation risk if expertized. The top-$k{=}L/2$ layers by $\mathcal{S}$ are selected; the remaining layers retain their original dense FFN. Table~\ref{tab:layer_scores_main} reports per-layer scores for DeiT-Small (200-image calibration); block~0 ranks last due to sensitivity~$=$~0.946.
 
-\textbf{Three sub-scores explained:}
+\begin{table}[!t]
+\caption{Per-layer composite scores, DeiT-Small (200-image calibration). Composite $= 0.4{\cdot}\text{sp} + 0.4{\cdot}\text{cl} - 0.2{\cdot}\text{se}$. Bold = selected (top-$k{=}6$).}
+\label{tab:layer_scores_main}
+\centering
+\small
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Block} & \textbf{Sparsity} & \textbf{Clusterab.} & \textbf{Sensitivity} & \textbf{Composite} \\
+\midrule
+\textbf{blocks.1} & 0.180 & 0.526 & 0.171 & \textbf{0.248} \\
+\textbf{blocks.4} & 0.152 & 0.518 & 0.109 & \textbf{0.246} \\
+\textbf{blocks.5} & 0.152 & 0.520 & 0.113 & \textbf{0.246} \\
+\textbf{blocks.3} & 0.149 & 0.519 & 0.113 & \textbf{0.245} \\
+\textbf{blocks.6} & 0.147 & 0.522 & 0.123 & \textbf{0.243} \\
+\textbf{blocks.2} & 0.141 & 0.518 & 0.147 & \textbf{0.234} \\
+blocks.7  & 0.147 & 0.519 & 0.162 & 0.234 \\
+blocks.11 & 0.134 & 0.516 & 0.149 & 0.230 \\
+blocks.9  & 0.135 & 0.518 & 0.167 & 0.228 \\
+blocks.8  & 0.142 & 0.512 & 0.175 & 0.227 \\
+blocks.10 & 0.171 & 0.514 & 0.252 & 0.224 \\
+blocks.0  & 0.210 & 0.516 & 0.946 & 0.101 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
 
-\noindent\textbf{Sparsity($l$):} Fraction of activation values with $|x| < 0.01$ in layer $l$'s pre-FFN activations. High sparsity means many tokens barely activate this layer---these tokens could be routed to a ``skip'' expert cheaply. \emph{Higher sparsity = better expert candidate.}
+\subsection{Phase 3: Expert Extraction}
 
-\noindent\textbf{Clusterability($l$):} Run $k$-means with $k{=}E$ clusters on the $[N_\text{cal}, 384]$ activation matrix of layer $l$, then compute the Silhouette score. High Silhouette score means the 39,200 tokens naturally separate into $E$ groups in this layer's activation space---a prerequisite for experts to specialise meaningfully. \emph{Higher clusterability = better expert candidate.}
-
-\noindent\textbf{Sensitivity($l$):} Compute the gradient norm $\|\partial\mathcal{L}/\partial h_l\|$ of the classification loss with respect to layer $l$'s activations on the calibration set via standard autograd. High sensitivity means modifying this layer's computation substantially changes the model's predictions---expertising it risks accuracy loss. \emph{Higher sensitivity = worse expert candidate (subtracted).}
-
-\textbf{Selection:} Layers whose score exceeds the 50th percentile (median) of all layer scores are selected for expertisation. For DeiT-Small, this selects transformer blocks 6 through 11 (the last 6 of 12 FFN layers), consistent with AdaMV-MoE's finding that late layers specialise more than early layers \cite{chen2023adamvmoe}.
-
-\subsection{Phase 3: Expert Extraction via SVD and $k$-means}
-
-\textbf{What it is:} Each selected FFN weight matrix is decomposed into two components: (1) a \emph{shared basis} that captures visual features common to all tokens, and (2) $E$ \emph{residual experts} that capture features specific to each token cluster.
-
-\textbf{Mathematically:} For a selected FFN layer's weight matrix $W \in \mathbb{R}^{d \times d_\text{ffn}}$ ($d{=}384$, $d_\text{ffn}{=}1536$ for DeiT-Small):
-
+For each selected layer, fc2 ($W_2 \in \mathbb{R}^{d \times d_\text{ffn}}$) is decomposed via truncated SVD; fc1 is shared identically across all experts:
 \begin{equation}
-W \approx \underbrace{U_r \Sigma_r V_r^\top}_{W_\text{shared}} + \sum_{e=1}^{E} m_e(x) \cdot \underbrace{W_e^\text{res}}_{\text{expert } e}
+y = \underbrace{W_\text{shared}}_{\text{SVD-}r\text{ approx.}} \!\cdot z + \underbrace{W_{e^*}^\text{res}}_{\text{cluster residual}} \!\cdot z, \;\; z = \text{GELU}(\text{fc1}(x))
 \label{eq:decomp}
 \end{equation}
-
-\textbf{Step 1 --- Shared basis via SVD:}
-Truncated SVD factorises $W = U\Sigma V^\top$ and retains only the top-$r$ singular values: $W_\text{shared} = U_r \Sigma_r V_r^\top$. Intuitively, $W_\text{shared}$ captures the most common directions of variation---the visual patterns relevant to \emph{all} tokens (e.g., universally useful edge or colour features). We set $r$ automatically as the number of singular values capturing the first 50th percentile of cumulative singular value energy ($r \approx 192$ for DeiT-Small).
-
-\textbf{Step 2 --- Expert residuals via $k$-means:}
-Run $k$-means with $k{=}E$ on the calibration activations for layer $l$ to partition all 39,200 tokens into $E{=}4$ clusters ($\mathcal{C}_1, \ldots, \mathcal{C}_4$). Each cluster groups semantically similar tokens. For each expert $e$, compute the average weight deviation over its cluster:
-$W_e^\text{res} = \text{mean}_{i \in \mathcal{C}_e}(W - W_\text{shared}) \cdot h_i / \|h_i\|$
-
-This residual captures the \emph{additional} computation needed for tokens in cluster $e$, beyond what the shared basis already provides.
-
-\textbf{During inference:} token $x$ computes $W_\text{shared}(x) + W_{e^*}^\text{res}(x)$ where $e^* = \text{router}(x)$ is the expert assigned by the router. The shared computation runs for all tokens; only one expert residual runs per token.
-
-\textbf{Reconstruction fidelity:} We measured $\|W - W_\text{approx}\|_F / \|W\|_F$ across all 6 extracted DeiT-Small layers: range 0.4719--0.5166. This means the shared+residual approximation retains approximately 50\% of the original weight matrix's energy---a controlled lossy compression. The remaining 50\% is the information that the expert routing must recover through specialised routing.
+$W_\text{shared} = U_r\Sigma_r V_r^\top$ retains the top-$r$ singular values (default $r$ = 50\% of matrix rank, $r{=}d/2{=}192$ for DeiT-Small where $W_2{\in}\mathbb{R}^{384\times1536}$ has maximum rank 384; materialised as a dense matrix before inference, with no factorised compute reduction). $k$-means with $k{=}E$ partitions calibration tokens into $E$ clusters; the per-cluster residual is $W_e^\text{res} = (W_2 - W_\text{shared})\cdot s_e$, where $s_e$ scales by the ratio of cluster-mean to global-mean activation norm. Because $s_e$ is a scalar, all residual experts share the same directional component $(W_2 - W_\text{shared})$, differing only in magnitude; a misrouted token therefore receives a different scaling but the same directional correction. During inference, $z$ is computed once and reused for both the shared and residual paths.
 
 \subsection{Phase 4: Router Fitting}
 
-\textbf{What it is:} The router is a small neural network (as small as a single linear layer: 384 inputs $\to$ 4 outputs = 1,536 parameters) that learns to predict which expert a given token should use, based on its activation vector.
-
-\textbf{How it was trained:} The $k$-means clustering in Phase 3 already assigned every calibration token to an expert (cluster label 0--3). This provides supervised training signal: given token $h$, predict cluster label $c$. Router training:
-\begin{itemize}
-\item Loss: cross-entropy between router logits and $k$-means cluster label
-\item Optimizer: AdamW, lr $= 10^{-3}$, weight decay $= 0.01$, cosine learning-rate decay
-\item Epochs: 5 (convergence confirmed via held-out calibration accuracy)
-\item Data: 200-image calibration tokens re-forwarded through frozen backbone up to each selected layer
-\end{itemize}
-
-\textbf{Why this works:} The $k$-means cluster labels encode the natural grouping of tokens by their activation patterns. The router learns this grouping. At inference time, new unseen tokens are assigned to the expert whose cluster their activations most resemble.
-
-\subsection{Router Variants}
-
-Seven router architectures are implemented to explore the tradeoff between routing accuracy, overhead, and load balance:
-
-\begin{enumerate}
-\item \textbf{Linear}: Single matrix $W_g \in \mathbb{R}^{d \times E}$; cheapest possible gate. Logits $= x W_g$; top-1 argmax selects expert.
-\item \textbf{MLP}: Two-layer gate with hidden dimension $d/2$; adds representational capacity at small cost.
-\item \textbf{Expert-Choice}: Instead of tokens choosing experts, each expert selects its top-$C$ tokens (capacity $C = T/E$). Eliminates overflow at the cost of some tokens potentially being unrouted.
-\item \textbf{Comm-Aware}: Linear gate plus a learned communication-cost penalty $\lambda \cdot \text{cost}(e)$ that discourages routing to experts incurring high transfer cost. Useful when experts are distributed across devices.
-\item \textbf{Path-Consistent}: Routing decisions are shared (copied) across spatially adjacent transformer blocks, reducing re-routing overhead between consecutive layers.
-\item \textbf{Self-Routing}: Parameter-free routing derived by projecting the hidden state into a subspace defined by the expert weight matrices themselves---no learnable gating parameters.
-\item \textbf{ALFRouter (novel)}: Replaces the auxiliary loss term (a penalty added to the training loss to encourage load balance) with a per-expert bias $b_e$ that is adjusted during inference proportionally to expert load deviation. This eliminates the need to tune $\lambda_\text{aux}$ while achieving comparable load balance (see Section~\ref{sec:novel}).
-\end{enumerate}
+A router $g_\theta$ predicts the cluster assignment of each token. The $k$-means labels from Phase~3 provide supervised targets: router training minimizes cross-entropy between $g_\theta(x)$ and cluster label $c$ over the calibration tokens, using AdamW ($\text{lr}{=}10^{-3}$, 5 epochs, cosine decay). Three router architectures are evaluated: \textbf{Linear} ($d\times E$ parameters, 9.2K total), \textbf{MLP} (hidden layer $d/6$, 149K), and \textbf{Adaptive} (confidence-threshold top-1/top-2 escalation, same parameter count as Linear).
 
 \subsection{Dispatch Backends}
 
-A \emph{dispatch backend} controls how tokens are physically distributed to experts on GPU hardware. The naive approach (loop over experts, apply boolean mask) wastes memory bandwidth. More sophisticated backends exploit GPU parallelism:
+Three CUDA backends are implemented: (1)~\textbf{Naive}: boolean-mask loop over experts (reference). (2)~\textbf{Grouped}: tokens are sorted by expert index; one GEMM per contiguous sub-batch. No padding; throughput stable under imbalance. (3)~\textbf{cuBLAS}: expert sub-batches are padded to the largest and stacked into a 3D tensor dispatched to a batched GEMM call. Fastest at balanced load; degrades at high imbalance from padding waste.
 
-\begin{enumerate}
-\item \textbf{Naive}: For each expert $e$, apply a boolean mask to extract its tokens, compute FFN, scatter results back. Serial loop over $E$ experts. Reference only.
-\item \textbf{Grouped (Route-Sorted)}: Sort all tokens by expert assignment, creating contiguous memory blocks per expert. Compute each expert's block via a single GEMM. Coalesced memory access eliminates scatter-gather overhead.
-\item \textbf{Stream}: Allocate three CUDA streams (dispatch stream, expert computation stream, gather stream). Overlap data movement with computation temporally.
-\item \textbf{Stream\_fine (novel)}: Allocate one CUDA stream per expert. Each expert's dispatch, GEMM, and gather run concurrently on separate streams, enabling finer-grained overlap at the cost of per-stream launch overhead.
-\item \textbf{Triton}: A single fused GPU kernel (written in OpenAI Triton) performs scatter + grouped GEMM + gather in one pass, eliminating all Python-layer dispatch overhead and intermediate memory writes.
-\item \textbf{cuBLAS Batched-GEMM}: Stack all expert sub-batches into a 3D tensor $B_\text{exp} \in \mathbb{R}^{E \times T_e \times d}$ and dispatch to \texttt{torch.bmm}, which calls NVIDIA's highly-optimised cuBLAS batched matrix multiplication. Fastest at balanced load; degrades when sub-batches are highly unequal in size (requires padding to uniform $T_e$).
-\end{enumerate}
-
-\textbf{Token boundary detection:} To find where each expert's tokens begin/end after sorting, we use \texttt{torch.searchsorted}---an $O(E \log N)$ binary search on the GPU-resident sorted index array. This replaces a naive $O(N \cdot E)$ sequential scan and achieves 3--8$\times$ speedup at $N{=}1568$ tokens, $E{=}8$ experts.
-
-\subsection{MoE Architecture Variants}
-
-Beyond the base hard-routed CLEAR-MoE:
-
-\begin{itemize}
-\item \textbf{H-MoE (Hierarchical)}: Two-level routing---a coarse router first selects one of $G$ expert groups, then a fine router selects one of $K$ experts within the group. Tested with $G{=}2$, $K{=}2$ (equivalent to $E{=}4$ total with two routing steps).
-\item \textbf{Soft-MoE}: All $E{=}4$ experts activate for every token; outputs are blended by softmax-weighted sum $\sum_e p_e \cdot W_e^\text{res}(x)$. No routing errors possible---this is the quality upper bound, at $E\times$ the expert compute cost.
-\item \textbf{Elastic-MoE}: Confidence-threshold routing: if the router's top-1 probability $> t$, use top-1 expert (cheap); if $\leq t$, use top-2 experts (safe). Tested at $t \in \{0.1, 0.2, 0.3, 0.4, 0.5\}$.
-\item \textbf{Capacity-MoE}: Each expert has a fixed token capacity $C$. If more than $C$ tokens route to one expert, the overflow tokens are routed to a second-choice expert. Prevents load imbalance but adds complexity.
-\end{itemize}
-
-\subsection{Novel Module: DisaggregatedSim and PCIe Overhead Measurement}
-
-\textbf{What disaggregated inference means:} In a standard co-located setup, both the router and the expert FFNs run on the same GPU. In a \emph{disaggregated} setup, the router executes on CPU (leveraging CPU memory capacity for large routing tables) and the expert FFNs execute on GPU (leveraging GPU compute for dense matrix operations). Data must cross the CPU--GPU interconnect (PCIe bus) in both directions.
-
-\textbf{How PCIe overhead is measured:} The \texttt{DisaggregatedSim} module (\texttt{clear\_moe/runtime/disaggregated.py}) times the complete disaggregated inference cycle comprising four sequential stages:
-\begin{enumerate}
-\item \textbf{CPU routing:} The router forward pass executes on CPU, producing a token-assignment tensor of shape $[B \times T] = [8 \times 196] = [1568]$ int64 indices. Size: $1568 \times 8 = 12{,}544$ bytes = 12.3 KB.
-\item \textbf{PCIe transfer (CPU $\to$ GPU):} The assignment tensor is transferred from CPU RAM to GPU VRAM via \texttt{tensor.to('cuda')}. At PCIe Gen3 $\times$16 peak bandwidth of 16 GB/s, 12.3 KB takes $< 1\,\mu$s bandwidth-limited---but CPU$\leftrightarrow$GPU transfers also incur fixed \emph{synchronisation latency} (driver overhead, DMA setup) that dominates for small payloads.
-\item \textbf{GPU expert GEMM:} Expert FFN computation on GPU using the received assignments.
-\item \textbf{PCIe transfer (GPU $\to$ CPU):} Output activations ($[1568, 384]$ FP32 = 2.4 MB) transferred back to CPU.
-\end{enumerate}
-
-\textbf{Measured result:} Total disaggregated latency = \textbf{5.04 ms per batch}. Co-located serial baseline (all operations on GPU) = 1.965 ms per batch. Net PCIe overhead:
-$$\Delta_\text{PCIe} = 5.04 - 1.965 = \mathbf{3.08\text{ ms per batch}}$$
-This 3.08 ms overhead is 1.57$\times$ the expert GEMM time itself, confirming that PCIe synchronisation---not expert computation---is the bottleneck of disaggregated inference. To make disaggregated serving practical, this 3.08 ms transfer cost must be hidden by pipelining it behind concurrent expert computation on subsequent batches.
-
-\subsection{Algorithm Summary}
-
-Algorithms~\ref{alg:scoring}--\ref{alg:dispatch} formalise the four pipeline phases.
-
-\begin{algorithm}[htbp]
-\caption{Phase 2: Layer Scoring and Selection}
-\label{alg:scoring}
-\begin{algorithmic}[1]
-\Require Calibration activations $\{h_l^{(i)}\}_{l=1}^{L}$ ($L{=}12$, $N_\text{cal}{=}39200$ tokens per layer)
-\Ensure Selected layer indices $\mathcal{L}_\text{sel}$
-\For{each layer $l \in \{1, \ldots, L\}$}
-  \State $\text{sparsity}(l) \gets |\{h : |h| < 0.01\}| / N_\text{cal}$
-  \State $\text{clusterability}(l) \gets \text{Silhouette}(k\text{-means}(h_l, E))$
-  \State $\text{sensitivity}(l) \gets \|\partial\mathcal{L}/\partial h_l\|_2$
-  \State $\mathcal{S}(l) \gets 0.4 \cdot \text{sparsity}(l) + 0.4 \cdot \text{clusterability}(l) - 0.2 \cdot \text{sensitivity}(l)$
-\EndFor
-\State $\mathcal{L}_\text{sel} \gets \{l : \mathcal{S}(l) > \text{median}(\mathcal{S})\}$
-\end{algorithmic}
-\end{algorithm}
-
-\begin{algorithm}[htbp]
-\caption{Phase 3: Expert Extraction}
-\label{alg:extraction}
-\begin{algorithmic}[1]
-\Require $W \in \mathbb{R}^{d \times d_\text{ffn}}$, calibration tokens $h \in \mathbb{R}^{N_\text{cal} \times d}$, expert count $E$, rank $r$
-\Ensure $W_\text{shared}$, $\{W_e^\text{res}\}_{e=1}^E$
-\State $[U, \Sigma, V] \gets \text{SVD}(W)$; \quad $W_\text{shared} \gets U_r \Sigma_r V_r^\top$
-\State $\{C_1, \ldots, C_E\} \gets k\text{-means}(h, E)$
-\For{$e \in \{1, \ldots, E\}$}
-  \State $W_e^\text{res} \gets |C_e|^{-1} \sum_{i \in C_e} (W - W_\text{shared}) \cdot h_i / \|h_i\|$
-\EndFor
-\end{algorithmic}
-\end{algorithm}
-
-\begin{algorithm}[htbp]
-\caption{Phase 4: Router Fitting}
-\label{alg:router}
-\begin{algorithmic}[1]
-\Require Calibration activations $h$, cluster labels $c$ (from $k$-means), 5 training epochs
-\Ensure Fitted router $\theta$
-\State Init router $\text{Router}(\cdot;\theta)$; AdamW(lr$=10^{-3}$, wd$=0.01$, cosine decay)
-\For{each epoch and each batch $(h_b, c_b)$}
-  \State $\mathcal{L} \gets \text{CrossEntropy}(\text{Router}(h_b;\theta),\; c_b)$
-  \State $\theta \gets \text{AdamW.update}(\theta, \nabla_\theta \mathcal{L})$
-\EndFor
-\end{algorithmic}
-\end{algorithm}
-
-\begin{algorithm}[htbp]
-\caption{Inference with Dispatch Backend}
-\label{alg:dispatch}
-\begin{algorithmic}[1]
-\Require Tokens $x \in \mathbb{R}^{B \times T \times d}$, $W_\text{shared}$, $\{W_e^\text{res}\}$, Router, backend
-\Ensure Output $y$
-\State $h_\text{shared} \gets x \cdot W_\text{shared}$ \Comment{Runs for all tokens}
-\State $a \gets \text{argmax}(\text{Router}(x), \text{dim}=-1)$ \Comment{Expert assignment per token}
-\If{backend = \texttt{grouped}}
-  \State $\text{sorted\_tokens} \gets \text{sort}(x, \text{by } a)$; boundaries via \texttt{searchsorted}
-  \State $y_e \gets x_e \cdot W_e^\text{res}$ for each contiguous expert block
-\ElsIf{backend = \texttt{cuBLAS}}
-  \State Pad sub-batches to equal size $\hat{T}$; stack into $B_\text{exp} \in \mathbb{R}^{E \times \hat{T} \times d}$
-  \State $Y \gets \texttt{torch.bmm}(B_\text{exp},\; W_e^\text{res})$
-\EndIf
-\State $y \gets h_\text{shared} + y_\text{experts}$ \Comment{Combine shared and expert outputs}
-\end{algorithmic}
-\end{algorithm}
-
-%─────────────────────────────────────────────────────────────────────────────
-\section{Experimental Setup}
-\label{sec:setup}
-
-\subsection{Hardware and Software}
-
-Table~\ref{tab:setup} lists the single-machine setup used for all experiments. All experiments use fixed random seeds (NumPy 42, PyTorch 42) and are reproducible. Latency measurements use \texttt{torch.cuda.synchronize()} before and after each timed region to ensure GPU operations are complete before the CPU timer stops.
-
-\begin{table}[htbp]
-\caption{Hardware and Software Configuration}
-\label{tab:setup}
-\centering
-\small
-\setlength{\tabcolsep}{4pt}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{p{2.8cm}p{4.5cm}}
-\toprule
-\textbf{Item} & \textbf{Specification} \\
-\midrule
-Operating system & Windows 11 Pro \\
-GPU & NVIDIA GeForce GTX 960 \\
-GPU memory & 4.0 GB GDDR5 \\
-GPU memory bandwidth & 112 GB/s \\
-GPU peak FP32 throughput & 2.4 TFLOP/s \\
-GPU ridge point & 21.4 FLOPs/Byte \\
-CUDA version & 11.8 \\
-PyTorch & 2.6.0+cu118 \\
-Classification backbone & DeiT-Small (\texttt{deit\_small\_patch16\_224}) \\
- & 22M parameters; $d{=}384$; $d_\text{ffn}{=}1536$; 12 blocks \\
-Segmentation backbone & SegFormer-B0 (\texttt{nvidia/segformer-b0}) \\
-Default expert count $E$ & 4 \\
-Default basis rank $r$ & Auto (50th-percentile singular values $\approx 192$) \\
-Calibration size & 200 images \\
-Router training & 5 epochs, AdamW, lr $10^{-3}$, cosine decay \\
-Latency measurement & p50 of 100 timed forward passes; \texttt{cuda.synchronize()} \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\subsection{Evaluation Metrics}
-
-Table~\ref{tab:metrics} defines every reported metric and explains what it measures. Understanding these metrics is essential for interpreting the results.
-
-\begin{table}[htbp]
-\caption{Evaluation Metric Definitions and Interpretation}
-\label{tab:metrics}
-\centering
-\small
-\renewcommand{\arraystretch}{1.1}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{p{2.2cm}p{5.0cm}}
-\toprule
-\textbf{Metric} & \textbf{Definition and Interpretation} \\
-\midrule
-\textbf{Top-1 Accuracy} & Fraction of test images where the model's single highest-probability class prediction matches the ground-truth label. Primary classification quality metric. \\
-\textbf{Top-5 Accuracy} & Fraction of images where the correct label appears in the model's top-5 predictions. Useful when Top-1 drops; indicates whether the model ``knows'' the right answer even if not top-ranked. \\
-\textbf{Accuracy Retention} & MoE Top-1 / Dense Top-1 $\times$ 100\%. Measures how much classification quality is preserved after extraction; 100\% = no degradation. \\
-\textbf{mIoU} & Mean Intersection-over-Union: $\text{IoU}_c = \frac{|\text{pred}_c \cap \text{gt}_c|}{|\text{pred}_c \cup \text{gt}_c|}$; averaged over all 19 Cityscapes classes. Values in [0,1]; higher is better. Gold standard for semantic segmentation. \\
-\textbf{p50 Latency (ms)} & Median of 100 repeated forward-pass wall-clock times (ms). Median (not mean) is used to be robust against outlier spikes from OS scheduling or GPU context switches. \\
-\textbf{Throughput img/s} & Images processed per second at the test batch size. Inverse of per-image latency; higher = faster system. \\
-\textbf{Throughput tok/s} & Tokens processed per second by the dispatch benchmark (196 tokens/image $\times$ batch size). Used for dispatch backend comparison independent of model size. \\
-\textbf{Speedup} & Ratio of configuration throughput to a baseline throughput. E.g., 18.63$\times$ = 18.63 times more tokens processed per second than the reference. \\
-\textbf{Active-param reduction} & Percentage reduction in parameters activated per inference token: $(1 - k/E) \times \text{expert\_param\_fraction}$. \\
-\textbf{Hotness skew} & $\max_e(\text{tokens}_e) / \text{mean}_e(\text{tokens}_e)$. Measures load imbalance across experts; perfect balance = 1.0; skew $> 2$ indicates one expert receives twice the average load. \\
-\textbf{Arithmetic Intensity} & FLOPs per byte of memory accessed. High AI (above ridge point) = bottlenecked by compute; low AI (below ridge point) = bottlenecked by memory bandwidth. \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\subsection{Complete Experimentation Pipeline}
-
-Table~\ref{tab:expmatrix} provides the full matrix of all experimental configurations, covering: (1) single-threaded CPU, (2) multi-threaded CPU, (3) single GPU across all dispatch backends, (4) heterogeneous CPU-router + GPU-expert disaggregation with measured PCIe overhead, (5) simulated multi-device parallelism (EP/DP/PP), (6) all seven router architectures on the same hardware, and (7) three novel module evaluations. This unified view allows direct comparison across all design axes.
-
-\begin{table*}[htbp]
-\caption{Complete Experimentation Pipeline: All Configurations, Results, and Interpretation}
-\label{tab:expmatrix}
-\centering
-\tiny
-\setlength{\tabcolsep}{2pt}
-\renewcommand{\arraystretch}{0.85}
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{p{2.0cm}p{2.4cm}p{1.7cm}p{1.5cm}p{0.9cm}p{1.1cm}p{1.7cm}p{2.0cm}}
-\toprule
-\textbf{Category} & \textbf{Configuration} & \textbf{Compute Device} & \textbf{Router} & $\boldsymbol{E}$ & \textbf{tok/s} & \textbf{Speedup vs CPU-1T} & \textbf{Key Observation} \\
-\midrule
-\multirow{2}{*}{\textbf{CPU Baseline}}
-  & Serial, 1 thread & CPU only & None & -- & 13,410 & 1.00$\times$ & Absolute reference; no GPU \\
-  & Multi-thread, 4 threads & CPU only & None & -- & 30,498 & 2.27$\times$ & Sub-linear: memory-bandwidth bottleneck \\
-\midrule
-\multirow{5}{*}{\textbf{Single GPU (5 backends)}}
-  & Naive sequential & GPU & Linear & 4 & 132,170 & 9.86$\times$ & Strictly dominated; baseline only \\
-  & Route-sorted grouped & GPU & Linear & 4 & 151,140 & 11.27$\times$ & Coalesced memory; stable across imbalance \\
-  & CUDA stream (3-stream) & GPU & Linear & 4 & 140,293 & 10.46$\times$ & Temporal overlap; best at 0--40\% imbalance \\
-  & Triton scatter-gather (fused) & GPU & Linear & 4 & 186,374 & 13.90$\times$ & Best at $\geq$60\% imbalance; imbalance-agnostic \\
-  & cuBLAS batched-GEMM & GPU & Linear & 4 & \textbf{249,775} & \textbf{18.63$\times$} & Best at 0\% imbalance; degrades at 80\% (padding) \\
-\midrule
-\textbf{CPU+GPU Heterogeneous}
-  & Disaggregated (CPU router + GPU expert) & CPU $\leftrightarrow$ GPU & CPU & 4 & 93,637 & 6.98$\times$ & PCIe penalty: 5.04 ms/batch; slower than GPU-only \\
-\midrule
-\multirow{3}{*}{\textbf{Multi-device (simulated)}}
-  & Expert parallel (EP-2) & 2$\times$GPU sim. & Linear & 4 & 174,802 & 13.04$\times$ & 22\% overhead from all-to-all communication \\
-  & Data parallel (DP-2) & 2$\times$GPU sim. & Linear & 4 & 72,549 & 5.41$\times$ & AllReduce comm-bound (AI = 0.5 FLOPs/byte) \\
-  & Pipeline parallel (PP-2) & 2$\times$GPU sim. & Linear & 4 & 7,640 & 0.57$\times$ & Pipeline bubbles collapse efficiency to 3\% \\
-\midrule
-\multirow{7}{*}{\textbf{Multi-router (cuBLAS backend)}}
-  & Linear router & GPU & Linear & 4 & 249,775 & 18.63$\times$ & Cheapest gate; fastest inference \\
-  & MLP router & GPU & MLP & 4 & $\approx$235,000 & $\approx$17.5$\times$ & +capacity; marginal accuracy improvement \\
-  & Expert-Choice router & GPU & Expert-Choice & 4 & $\approx$220,000 & $\approx$16.4$\times$ & Deterministic capacity; no overflow \\
-  & Comm-Aware router & GPU & Comm-Aware & 4 & $\approx$210,000 & $\approx$15.7$\times$ & $\lambda$ penalty discourages costly expert routes \\
-  & Path-Consistent router & GPU & Path-Consistent & 4 & $\approx$215,000 & $\approx$16.0$\times$ & Cross-layer routing coherence \\
-  & Self-Routing & GPU & Self-Routing & 4 & $\approx$240,000 & $\approx$17.9$\times$ & No learnable parameters; subspace projection \\
-  & ALFRouter (novel) & GPU & ALF & 4 & $\approx$245,000 & $\approx$18.3$\times$ & Skew reduced 2.204$\to$2.184; lat 0.638$\to$0.572 ms \\
-\midrule
-\multirow{3}{*}{\textbf{Novel modules}}
-  & ALFRouter (full eval) & GPU & ALF & 4 & -- & -- & No auxiliary loss; bias-based capacity control \\
-  & stream\_fine (dry run) & GPU & Linear & 4 & -- & -- & 2.545 ms vs grouped 2.395 ms; SM overhead on GTX 960 \\
-  & DisaggregatedSim & CPU$\leftrightarrow$GPU & CPU & 4 & -- & -- & \textbf{5.04 ms PCIe overhead}; $\Delta{=}3.08$ ms above serial \\
-\midrule
-\multicolumn{8}{l}{\textit{Note: Multi-router tok/s values marked $\approx$ are representative; exact measured values for Linear and ALFRouter only.}} \\
-\multicolumn{8}{l}{\textit{Multi-device (simulated): synthetic all-to-all and micro-batch communication models; not actual NCCL execution.}} \\
-\end{tabular}
-}
-\end{table*}
-
-%─────────────────────────────────────────────────────────────────────────────
-\section{Results}
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+\section{Experiments}
 \label{sec:results}
 
-\subsection{Dense Baseline}
+\textbf{Setup.} DeiT-Small (22M parameters, $d{=}384$, $d_\text{ffn}{=}1536$, 12 blocks) evaluated on Imagenette (3,925 validation images, 10-class ImageNet subset) with 200-image calibration set, $E{=}4$ experts, AdamW router training (5 epochs, lr\,$10^{-3}$, cosine decay). All timing: p50 of 100 forward passes, batch size 8, GTX\,960 (4\,GB, 112\,GB/s), \texttt{cuda.synchronize()}-fenced.
 
-\textbf{What this measures:} The dense baseline establishes the quality and speed ceiling of the unmodified pretrained model. All CLEAR-MoE variant results are reported \emph{relative} to this baseline. A result matching the baseline means extraction introduced zero quality degradation.
+\subsection{Decomposition Ablation (D0--D8)}
 
-\textbf{How it was obtained:} DeiT-Small was loaded from \texttt{timm} with pretrained ImageNet-1K weights and evaluated on the 3,885-image cleaned Imagenette validation split. The model produces 1000-dimensional logit vectors; we take the argmax and compare against the ground-truth Imagenette class index. \emph{Note on label-space mismatch}: Imagenette's 10 classes correspond to specific ImageNet class indices (e.g., ``tench'' = class 0, ``golf ball'' = class 574). We map predictions to the 10 local Imagenette class indices before computing accuracy. Latency was measured as the p50 of 100 forward passes with batch size 8.
+Table~\ref{tab:cls} ablates what each architectural choice contributes to accuracy and latency. Configurations D0--D8 span the design space from dense baseline to shared-basis CLEAR-MoE FFN, isolating the effect of the shared basis, the routing mechanism, and the expert assignment strategy.
 
-\FloatBarrier
-\begin{table}[htbp]
-\caption{Dense Baseline Performance}
-\label{tab:dense}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{llrrrr}
-\toprule
-\textbf{Task} & \textbf{Model} & \textbf{Top-1 / mIoU} & \textbf{Top-5 / Mean Acc.} & \textbf{Lat. p50 (ms)} & \textbf{Thpt (img/s)} \\
-\midrule
-Classification & DeiT-Small & 86.69\% & 98.48\% & 11.37 & 99.08 \\
-Classification & DeiT-Base & 86.xx\% & 98.xx\% & 38.93 & 23.13 \\
-Segmentation & SegFormer-B0 & 0.5757 mIoU & 5.26\% mean acc. & 42.32 & 21.47 \\
-Segmentation & SegFormer-B2 & 0.2788 mIoU & 5.26\% mean acc. & 146.53 & 6.68 \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\textbf{Interpretation:} DeiT-Small's 86.69\% Top-1 is the target to match. The 98.48\% Top-5 confirms the model is highly confident on correct classes. The 11.37 ms p50 latency and 99.08 img/s throughput are the runtime baseline that CLEAR-MoE variants must approximate. SegFormer-B0's 0.5757 mIoU on Cityscapes is the segmentation quality floor that extraction must preserve.
-
-\subsection{Classification: MoE Variant Comparison}
-
-\textbf{What this measures:} Whether converting DeiT-Small FFN layers (blocks 6--11) to sparse MoE preserves classification accuracy, and at what latency cost.
-
-\textbf{How it was obtained:} Each MoE variant was evaluated on the full 3,885-image validation split. For each image, every selected FFN layer performs: (1) shared-basis computation $h_\text{shared} = x W_\text{shared}$; (2) router inference to select expert(s); (3) expert residual computation; (4) output $= h_\text{shared} + h_\text{expert}$. Non-selected layers (blocks 0--5) execute their original dense FFN unchanged.
-
-\FloatBarrier
-\begin{table}[htbp]
-\caption{Classification Results (DeiT-Small, Imagenette, $E{=}4$, \texttt{last\_half} strategy)}
+\begin{table}[!t]
+\caption{Decomposition ablation (DeiT-Small, Imagenette, $E{=}4$, last-$k$ layers, batch=8, GTX\,960). $\Delta$Top-1 relative to D0. D4/D5 differ only in random seed. D6 and D8 are the same architecture: D6 is the cold-kernel first dispatch; D8 is measured after 3 warm-up passes (steady-state). The 21\,ms gap reflects CUDA JIT overhead on first run.}
 \label{tab:cls}
 \centering
 \small
+\setlength{\tabcolsep}{3pt}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrrr}
+\begin{tabular}{clllrrr}
 \toprule
-\textbf{Variant} & \textbf{Top-1} & \textbf{Top-5} & \textbf{Lat. p50 (ms)} & \textbf{Thpt (img/s)} \\
+\textbf{ID} & \textbf{Shared fc1} & \textbf{Shared fc2} & \textbf{Router} & \textbf{Top-1} & $\boldsymbol{\Delta}$\textbf{pp} & \textbf{p50 ms} \\
 \midrule
-Dense (baseline) & 86.69\% & 98.48\% & 11.37 & 99.08 \\
+D0 & -- & -- & None (dense) & 86.73\% & $+$0.00 & 59.6 \\
 \midrule
-CLEAR-MoE (hard, top-1) & 86.51\% & 97.81\% & 20.95 & 56.21 \\
-H-MoE ($G{=}2, K{=}2$) & 86.51\% & 98.11\% & 48.22 & 42.15 \\
-Soft-MoE (all $E$ active) & 86.51\% & 97.81\% & 22.37 & 50.18 \\
-Elastic-MoE $t{=}0.1$ & 86.51\% & 97.81\% & 102.70 & 24.72 \\
-Elastic-MoE $t{=}0.2$ & 86.51\% & 97.81\% & 118.48 & 22.36 \\
-Elastic-MoE $t{=}0.3$ & 86.51\% & 97.81\% & 103.00 & 25.42 \\
-Elastic-MoE $t{=}0.4$ & 86.51\% & 97.81\% & 100.63 & 25.09 \\
-Elastic-MoE $t{=}0.5$ & 86.51\% & 97.81\% & 109.73 & 22.65 \\
-Capacity-MoE & 86.51\% & 97.81\% & 55.76 & 86.06 \\
+D1 & \checkmark & SVD rank-$r$ & None & 86.55\% & $-$0.18 & 59.7 \\
+D2 & \ding{55} & Disjoint & Random & 66.42\% & $-$20.31 & 49.4 \\
+D3 & \checkmark & Full residual & None & 86.73\% & $+$0.00 & 59.9 \\
+D4/D5 & \checkmark & $k$-means res. & Random & 86.62--65\% & $-$0.08--11 & 92.2 \\
+D6/D8 & \checkmark & $k$-means res. & Linear (learned) & 86.65\% & $-$0.08 & 78.8--100.3 \\
+D7 & \ding{55} & Disjoint & $k$-means & 65.22\% & $-$21.51 & 48.0 \\
 \bottomrule
+\multicolumn{7}{l}{\footnotesize \ding{55}\,=\,disjoint (no shared fc1); \checkmark\,=\,shared across all tokens.}
 \end{tabular}
 }
 \end{table}
 
-\textbf{Interpretation of results:}
+\textbf{The shared SVD basis is the dominant accuracy-preserving component.} D3 (shared basis + full global residual, no routing) achieves exact reconstruction: algebraically, $W_\text{shared}{\cdot}z + (W_2{-}W_\text{shared}){\cdot}z = W_2{\cdot}z$, matching D0 at 86.73\%. D2 and D7 (disjoint experts, no shared fc1) collapse to 65--66\% regardless of routing strategy: disjoint expert weights estimated from 200 calibration images fail to generalize. In contrast, D4/D5 (shared basis, \emph{random} routing) retain 86.62--65\%, only 0.08--0.11\,pp below D0; D6/D8 (shared basis, learned routing at 95\% accuracy) achieve an identical $-$0.08\,pp. Routing quality has limited measured impact once the shared basis is present.
 
-\textbf{Accuracy:} All MoE variants achieve 86.51\% Top-1, a 0.18 percentage-point drop from the 86.69\% dense baseline (99.8\% accuracy retention). This near-perfect accuracy preservation confirms that the shared-basis decomposition retains the critical classification-relevant features in the extracted layers.
+\textbf{No latency reduction on GTX\,960.} CLEAR-MoE FFN (D4--D8) executes shared fc1+fc2 on \emph{all} tokens plus residual paths that collectively process all $T$ tokens ($T/E$ per expert $\times$ $E$ experts), adding approximately one full fc2-equivalent computation; total arithmetic is $\approx\!1.5\times$ dense FFN. On bandwidth-limited memory (112\,GB/s), this incurs 1.3--1.7$\times$ latency overhead (78--100\,ms vs.\ 59.6\,ms). Only disjoint experts (D2/D7) are faster (48--49\,ms) by eliminating the shared path entirely, at the cost of 21\,pp accuracy.
 
-\textbf{Hard CLEAR-MoE latency:} The 20.95 ms p50 is 1.84$\times$ slower than the dense baseline (11.37 ms). This overhead arises from: (a) routing computation at each of the 6 extracted layers, (b) scatter-gather operations to dispatch tokens to expert sub-batches, and (c) shared-basis computation running \emph{in addition to} the expert residual GEMM (it is not replaced). On the GTX 960, these memory-bound operations dominate, consistent with roofline analysis (Section~\ref{sec:roofline}).
-
-\textbf{Elastic-MoE latency:} The high latency (100--118 ms) despite 99.8\% accuracy indicates that most tokens at all tested thresholds $t \in [0.1, 0.5]$ fell below the confidence threshold, triggering top-2 routing. This is expected: routers trained on 200-image calibration are less confident than routers trained on larger sets. Increasing calibration size or adding temperature scaling would push more tokens into the single-expert path.
-
-\textbf{Capacity-MoE throughput anomaly:} Capacity-MoE achieves 86.06 img/s---closer to dense (99.08 img/s)---because its fixed-capacity design prevents overflow tokens from being routed to slower fallback paths, keeping GPU utilisation high.
-
-\subsection{Segmentation: CLEAR-MoE vs.\ Dense}
-
-\textbf{What this measures:} Whether expert extraction from classification layers transfers to the structurally different SegFormer-B0 backbone, and whether pixel-level prediction quality is preserved.
-
-\textbf{How it was obtained:} SegFormer-B0 was loaded with pretrained Cityscapes weights. CLEAR-MoE extraction was applied to the encoder's MixFFN blocks (SegFormer uses depth-wise convolution inside the FFN; our shared-basis projection accounts for the different weight dimensions). Evaluation: 500 Cityscapes validation images resized to $512{\times}512$, per-pixel class predictions computed, mIoU computed over all 19 Cityscapes categories.
-
-\FloatBarrier
-\begin{table}[htbp]
-\caption{Segmentation Results (Cityscapes, $512{\times}512$, $E{=}4$)}
-\label{tab:seg}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{llrrrr}
-\toprule
-\textbf{Backbone} & \textbf{Model} & \textbf{mIoU} & \textbf{Mean Acc.} & \textbf{Lat. p50 (ms)} & \textbf{Thpt (img/s)} \\
-\midrule
-\multirow{2}{*}{SF-B0}
-  & Dense (baseline) & 0.5757 & 5.26\% & 42.32 & 21.47 \\
-  & CLEAR-MoE ($E{=}4$, 4 layers) & 0.5757 & 5.26\% & 57.70 & 14.08 \\
-\midrule
- & Degradation & $0.0000$ & 0.00\% & $+15.38$ ms & $-7.39$ img/s \\
-\midrule
-\multirow{2}{*}{SF-B2}
-  & Dense (baseline) & 0.2788 & 5.26\% & 146.53 & 6.68 \\
-  & CLEAR-MoE (\texttt{depth0}, 0 layers extracted) & 0.2788 & 5.26\% & 146.05 & 6.64 \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\textbf{Interpretation:}
-
-\textbf{SF-B0 mIoU = 0.5757 (0.0 degradation):} The dense baseline mIoU is fully preserved. This confirms that the corrected shared-basis initialisation and Cityscapes-specific label mapping successfully generalise the extraction pipeline to segmentation---answering RQ4 with a positive result: even with 4 expertised layers, mIoU does not degrade.
-
-\textbf{SF-B0 latency overhead (+15.38 ms):} The 15.38 ms latency increase (42.32 $\to$ 57.70 ms p50) is attributable to routing and scatter-gather on the GTX 960's bandwidth-limited memory. This is significant but expected on consumer hardware; a higher-bandwidth GPU (A100: 2 TB/s vs GTX 960: 112 GB/s) would reduce routing overhead proportionally.
-
-\textbf{SF-B2 zero layers:} The \texttt{depth0} scoring policy selects zero FFN layers in SegFormer-B2 because B2's larger intermediate dimensions yield lower Silhouette scores under the default $k{=}4$ clustering---the layer-scoring function requires architecture-specific tuning for hierarchical backbones with MixFFN blocks.
-
-\subsection{Dispatch Strategy Benchmark}
-
-\textbf{What this measures:} The throughput and latency of each dispatch backend under four token-load imbalance scenarios. Token-load imbalance is the practical challenge of expert routing: in practice, some experts receive more tokens than others, causing load-imbalanced GPU compute.
-
-\textbf{How it was obtained:} A synthetic benchmark (independent of the full model) dispatches a batch of 1,568 tokens ($B{=}8$ images $\times 196$ tokens/image) to $E{=}4$ experts via each backend. Four imbalance levels were tested:
-\begin{itemize}
-\item \textbf{0\% imbalance}: 392 tokens to each expert (perfectly balanced).
-\item \textbf{40\% imbalance}: Expert 0 receives 627 tokens ($1.6\times$ average); others split remaining.
-\item \textbf{60\% imbalance}: Expert 0 receives 941 tokens ($2.4\times$ average).
-\item \textbf{80\% imbalance}: Expert 0 receives 1,254 tokens ($3.2\times$ average); extreme routing skew.
-\end{itemize}
-Token assignments were constructed synthetically to hit each target exactly. For each (backend, imbalance) cell, p50 latency and throughput were measured over 200 runs.
-
-\FloatBarrier
-\begin{table}[htbp]
-\caption{Dispatch Strategy Benchmark: Latency p50 (ms) and Throughput (tok/s)}
-\label{tab:dispatch}
-\centering
-\footnotesize
-\setlength{\tabcolsep}{4pt}
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrrrrrrr}
-\toprule
-& \multicolumn{2}{c}{\textbf{0\% Imbalance}} & \multicolumn{2}{c}{\textbf{40\% Imbalance}} & \multicolumn{2}{c}{\textbf{60\% Imbalance}} & \multicolumn{2}{c}{\textbf{80\% Imbalance}} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
-\textbf{Strategy} & p50 & tok/s & p50 & tok/s & p50 & tok/s & p50 & tok/s \\
-\midrule
-Naive Sequential & 11.70 & 131,627 & 11.75 & 129,044 & 11.31 & 130,645 & 11.34 & 129,660 \\
-Route-Sorted Grouped & 10.50 & 148,506 & 10.40 & 146,870 & 10.40 & 146,472 & 10.44 & 149,948 \\
-CUDA Stream & 10.17 & 152,813 & 10.47 & 147,802 & 10.48 & 143,621 & 10.86 & 137,909 \\
-Expert Fusion & 10.75 & 138,806 & 10.94 & 137,941 & 11.16 & 136,856 & 13.07 & 117,874 \\
-Adaptive & 10.77 & 143,069 & 11.26 & 138,262 & 10.95 & 140,134 & 13.63 & 112,715 \\
-Triton Scatter-Gather & 8.87 & 176,111 & 8.69 & 176,946 & \textbf{8.50} & \textbf{180,728} & \textbf{8.43} & \textbf{179,381} \\
-cuBLAS Batched-GEMM & \textbf{6.33} & \textbf{243,009} & \textbf{7.73} & \textbf{202,602} & 9.67 & 156,739 & 12.09 & 125,369 \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\begin{figure}[htbp]
-\centering
-\resizebox{\columnwidth}{!}{%
-\begin{tikzpicture}
-\begin{axis}[
-  width=\linewidth, height=5.5cm,
-  xlabel={Token Load Imbalance (\%)},
-  ylabel={Throughput ($\times 10^3$ tok/s)},
-  xtick={0,40,60,80},
-  legend style={font=\tiny, at={(0.5,-0.20)}, anchor=north,
-                legend columns=3, draw=none, fill=white,
-                fill opacity=0.88, text opacity=1, row sep=1pt},
-  ymin=50000, ymax=260000, ymajorgrids=true, grid style=dashed,
-  every axis plot/.append style={thick},
-  tick label style={font=\tiny}, label style={font=\small},
-  ytick={60000,100000,140000,180000,220000,260000},
-  yticklabels={60,100,140,180,220,260},
-]
-\addplot[color=red!70!black, mark=square*]
-  coordinates {(0,131627)(40,129044)(60,130645)(80,129660)};
-\addlegendentry{Naive Seq.}
-\addplot[color=blue!70!black, mark=triangle*]
-  coordinates {(0,148506)(40,146870)(60,146472)(80,149948)};
-\addlegendentry{Rt-Sorted Grp.}
-\addplot[color=green!60!black, mark=diamond*]
-  coordinates {(0,152813)(40,147802)(60,143621)(80,137909)};
-\addlegendentry{CUDA Stream}
-\addplot[color=orange!80!black, mark=pentagon*]
-  coordinates {(0,176111)(40,176946)(60,180728)(80,179381)};
-\addlegendentry{Triton S-G}
-\addplot[color=purple, mark=*, very thick]
-  coordinates {(0,243009)(40,202602)(60,156739)(80,125369)};
-\addlegendentry{cuBLAS GEMM}
-\end{axis}
-\end{tikzpicture}
-}
-\caption{Dispatch strategy throughput across token-load imbalance levels. cuBLAS batched-GEMM peaks at 0\% imbalance (243k tok/s) but degrades at 80\% due to padding waste. Triton scatter-gather is imbalance-agnostic, peaking at 60\% (181k tok/s) and dominating at $\geq$60\% imbalance.}
-\label{fig:dispatch}
-\end{figure}
-
-\textbf{Interpretation of dispatch results:}
-
-\textbf{cuBLAS at low imbalance:} cuBLAS stacks all expert sub-batches into a single 3D tensor and executes one highly-optimised batched GEMM. At 0\% imbalance all sub-batches are equal ($392$ tokens each)---no padding needed---yielding peak 243,009 tok/s. As imbalance rises, sub-batches differ in size; cuBLAS pads all to the size of the largest sub-batch, wasting compute on padded zeros. At 80\% imbalance (sub-batches: 1254, 104, 104, 106) cuBLAS pads three experts to 1254 tokens, wasting $\sim$73\% of compute---causing throughput collapse to 125,369 tok/s.
-
-\textbf{Triton's imbalance robustness:} The fused Triton kernel handles variable-length expert sub-batches natively via its scatter-gather logic, processing only the actual tokens assigned to each expert without padding. This makes throughput near-constant across all imbalance levels (176--181k tok/s), making Triton the preferred choice in production where token distribution is unpredictable.
-
-\textbf{Naive sequential:} Strict dominance by all other methods across all imbalance levels confirms that per-expert boolean masking with a sequential loop is the worst possible dispatch strategy.
-
-\textbf{Expert Fusion and Adaptive degradation at 80\%:} Both attempt to fuse expert computation but rely on assumptions of moderate imbalance; at 80\% the routing skew exceeds their assumptions, causing fallback to slower code paths.
-
-\subsection{CPU vs.\ GPU and Heterogeneous Scaling}
-
-\textbf{What this measures:} The absolute throughput gain from GPU acceleration, and the cost of disaggregated CPU-router + GPU-expert execution.
-
-\textbf{How it was obtained:} The same dispatch benchmark (1,568 tokens, grouped backend) was run with compute targets: CPU (1 thread), CPU (4 threads), GPU (all backends), and heterogeneous (router on CPU, expert GEMMs on GPU). Speedup is computed relative to CPU-serial-1-thread baseline.
-
-\FloatBarrier
-\begin{table}[htbp]
-\caption{CPU vs.\ GPU Throughput: All Compute Configurations}
-\label{tab:cpugpu}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrr}
-\toprule
-\textbf{Configuration} & \textbf{tok/s} & \textbf{Speedup vs CPU-1T} & \textbf{Notes} \\
-\midrule
-CPU serial (1 thread) & 13,410 & 1.00$\times$ & Absolute reference \\
-CPU serial (4 threads) & 30,498 & 2.27$\times$ & Bandwidth-limited scaling \\
-GPU naive sequential & 132,170 & 9.86$\times$ & Worst GPU strategy \\
-GPU route-sorted grouped & 151,140 & 11.27$\times$ & Coalesced memory access \\
-GPU CUDA stream (3-stream) & 140,293 & 10.46$\times$ & Temporal stream overlap \\
-GPU Triton scatter-gather & 186,374 & 13.90$\times$ & Fused kernel; imbalance-robust \\
-GPU cuBLAS batched-GEMM & \textbf{249,775} & \textbf{18.63$\times$} & Best overall at balanced load \\
-Heterogeneous CPU+GPU & 93,637 & 6.98$\times$ & PCIe roundtrip costs 5.04 ms/batch \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\textbf{Interpretation:}
-
-\textbf{CPU 4-thread sub-linear scaling} (2.27$\times$ not 4$\times$): Four CPU threads share the same memory bus. Matrix multiplication at this scale is memory-bandwidth-bound; quadrupling threads does not quadruple bandwidth.
-
-\textbf{GPU cuBLAS 18.63$\times$ speedup}: The GTX 960 executes massively parallel GEMM via thousands of CUDA cores vs.\ the CPU's 4 cores. The cuBLAS batched-GEMM exploits the GPU's matrix-unit hardware directly, achieving near-peak compute throughput for balanced workloads.
-
-\textbf{Heterogeneous CPU+GPU (6.98$\times$ only):} Routing on CPU introduces the 5.04 ms PCIe roundtrip per batch. At 13,410 CPU-serial-equivalent throughput for the router step, and 249,775 GPU throughput for the expert step, the PCIe bottleneck reduces the combined pipeline to 93,637 tok/s---\emph{slower than GPU-only naive sequential}. This directly answers RQ5: disaggregated inference is counterproductive without explicit PCIe latency amortisation.
-
-\subsection{Parallel Scaling (Simulated)}
-
-\textbf{What this measures:} How throughput scales when multiple compute devices (GPUs) are used with different parallelism strategies.
-
-\textbf{How it was obtained:} Multi-device execution was simulated using synthetic timing models rather than actual multi-GPU hardware. The simulation adds analytically-derived communication delays to measured single-GPU computation times:
-
-\begin{itemize}
-\item \textbf{Expert Parallel (EP-2)}: Experts 0--1 on device 0, experts 2--3 on device 1. Tokens must be redistributed between devices (all-to-all communication). All-to-all cost modelled as $\text{cost} = \text{data\_size} / \text{modelled\_BW}$ where data size $= B \times T \times d \times 4$ bytes and bandwidth is set to PCIe Gen3 ×16 (16 GB/s).
-\item \textbf{Data Parallel (DP-2)}: Each device processes half the batch; parameters are replicated. AllReduce cost modelled via AI $= 0.5$ FLOPs/byte for 22M parameters.
-\item \textbf{Pipeline Parallel (PP-2)}: Layers 0--5 on device 0, layers 6--11 on device 1. Pipeline bubble (idle time waiting for the previous micro-batch) modelled as $(S-1)/S$ fraction of total time where $S{=}2$ stages and $M{=}1$ micro-batch.
-\end{itemize}
-
-\FloatBarrier
-\begin{table}[htbp]
-\caption{Parallel Scaling Results (Simulated; GPU single as reference)}
-\label{tab:parallel}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrrr}
-\toprule
-\textbf{Mode} & \textbf{tok/s} & \textbf{Workers} & \textbf{Speedup vs GPU-1} & \textbf{Parallel Efficiency} \\
-\midrule
-CPU serial & 23,695 & 1 & 0.11$\times$ & 0.11 \\
-CPU multi-thread & 52,263 & 1 & 0.23$\times$ & 0.23 \\
-GPU single & 225,455 & 1 & 1.00$\times$ & 1.00 \\
-Expert parallel EP-2 (sim.) & 174,802 & 2 & 0.78$\times$ & 0.39 \\
-Data parallel DP-2 (sim.) & 72,549 & 2 & 0.32$\times$ & 0.16 \\
-Pipeline parallel PP-2 (sim.) & 7,640 & 2 & 0.03$\times$ & 0.02 \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\textbf{Interpretation:}
-
-\textbf{EP-2 efficiency = 0.39:} Two devices theoretically double throughput (efficiency = 1.00); measured efficiency of 0.39 means we recover only 78\% of single-GPU speed despite doubling hardware. The 22\% overhead is all-to-all communication (tokens redistributed between GPUs) which is bandwidth-bound (AI $= 0.1$ FLOPs/byte per Table~\ref{tab:roofline}).
-
-\textbf{DP-2 efficiency = 0.16:} Data-parallel scales poorly here because AllReduce of 22M parameters (88 MB at FP32) costs more than the computation itself for small batch sizes. At larger batch sizes (e.g., 128 images), DP efficiency would improve substantially.
-
-\textbf{PP-2 efficiency = 0.02:} With only 1 micro-batch and 2 pipeline stages, the pipeline bubble occupies 50\% of each device's time. Splitting the batch into $M \geq 8$ micro-batches would reduce bubble fraction to $(S-1)/(S+M-2) \approx 6\%$, recovering most of the theoretical 2$\times$ speedup.
-
-%─────────────────────────────────────────────────────────────────────────────
-\subsection{Roofline Analysis}
-\label{sec:roofline}
-
-\textbf{What roofline analysis is:} The roofline model plots achievable compute performance (GFLOPs/s) against arithmetic intensity (FLOPs/byte). Every operation falls either in the \emph{memory-bound region} (to the left of the ridge point---performance limited by how fast data can be loaded from memory) or the \emph{compute-bound region} (to the right---performance limited by the GPU's arithmetic throughput). The ridge point = peak\_FLOPs / memory\_bandwidth = 2,400 / 112 = 21.4 FLOPs/byte for the GTX 960.
-
-\textbf{How the values were computed:} For each operation, FLOPs were computed analytically from tensor shapes, and bytes were computed as the total bytes read/written (parameters + input activations + output activations, each at 4 bytes FP32). Arithmetic Intensity = FLOPs / bytes.
-
-\begin{table}[htbp]
-\caption{Roofline Analysis: Arithmetic Intensity per Operation (GTX 960, ridge = 21.4 FLOPs/Byte)}
-\label{tab:roofline}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{lrrrr}
-\toprule
-\textbf{Operation} & \textbf{FLOPs} & \textbf{Bytes} & \textbf{AI (F/B)} & \textbf{Regime} \\
-\midrule
-Dense FFN (fc1+fc2, full batch) & 4.62e8 & 6.22e6 & 74.3 & \textbf{Compute-bound} \\
-Shared basis SVD ($r{=}192$) & 5.78e7 & 1.04e6 & 55.5 & \textbf{Compute-bound} \\
-Expert GEMM ($E{=}4$, balanced) & 1.16e8 & 5.09e6 & 22.7 & \textbf{Compute-bound} \\
-\midrule
-Router linear gate & 6.02e5 & 3.10e5 & 1.9 & \textit{Memory-bound} \\
-Token argsort (sorting) & 1.49e3 & 1.57e3 & 1.0 & \textit{Memory-bound} \\
-H-MoE coarse router & 3.01e5 & 3.06e5 & 1.0 & \textit{Memory-bound} \\
-AllReduce (DP-2, 22M params) & 4.40e7 & 8.80e7 & 0.5 & \textit{Communication-bound} \\
-All-to-All (EP-2, $T{=}196$) & 7.53e4 & 6.02e5 & 0.1 & \textit{Communication-bound} \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\begin{figure}[htbp]
-\centering
-\resizebox{\columnwidth}{!}{%
-\begin{tikzpicture}
-\begin{loglogaxis}[
-  width=\linewidth, height=6cm,
-  xlabel={Arithmetic Intensity (FLOPs/Byte)},
-  ylabel={Performance (GFLOPs/s)},
-  xmin=0.05, xmax=200, ymin=0.01, ymax=5000,
-  grid=both, grid style={gray!30},
-  tick label style={font=\tiny}, label style={font=\small},
-  legend style={font=\tiny, at={(0.5,-0.22)}, anchor=north,
-                legend columns=2, draw=none, fill=white,
-                fill opacity=0.88, text opacity=1, row sep=1pt},
-]
-\addplot[domain=0.05:21.4, color=black, thick, dashed] {112 * x};
-\addplot[domain=21.4:200, color=black, thick, dashed] {2400};
-\addlegendentry{Roofline (GTX 960)}
-\addplot[mark=|, mark size=5pt, color=black] coordinates {(21.4,2400)};
-\addlegendentry{Ridge point (21.4 F/B)}
-\addplot[mark=*, mark size=4pt, color=blue] coordinates {(74.3,2400)};
-\addlegendentry{Dense FFN (compute)}
-\addplot[mark=square*, mark size=4pt, color=blue] coordinates {(55.5,2400)};
-\addlegendentry{Shared-basis SVD (compute)}
-\addplot[mark=triangle*, mark size=4pt, color=blue] coordinates {(22.7,2400)};
-\addlegendentry{Expert GEMM (compute)}
-\addplot[mark=diamond*, mark size=4pt, color=orange] coordinates {(1.9,112*1.9)};
-\addlegendentry{Router gate (memory)}
-\addplot[mark=pentagon*, mark size=4pt, color=orange] coordinates {(1.0,112*1.0)};
-\addlegendentry{Token sort (memory)}
-\addplot[mark=x, mark size=4pt, color=red] coordinates {(0.1,0.1*112)};
-\addlegendentry{All-to-All EP (comm.)}
-\end{loglogaxis}
-\end{tikzpicture}
-}
-\caption{Roofline model for GTX 960 (peak FP32: 2.4 TFLOP/s, memory BW: 112 GB/s). Operations right of the ridge point (21.4 FLOPs/Byte) are compute-bound (blue); those left are memory-bound (orange) or communication-bound (red). Dispatch overhead---routing and token movement---sits far left, confirming it as the primary latency bottleneck.}
-\label{fig:roofline}
-\end{figure}
-
-\textbf{Interpretation:}
-
-\textbf{Dense FFN (AI 74.3):} 3.5$\times$ above the ridge point. Dense FFN is solidly compute-bound---the GPU's arithmetic units are the bottleneck, and faster memory provides diminishing returns. cuBLAS efficiently exploits this by maximising GEMM utilisation.
-
-\textbf{Expert GEMM (AI 22.7):} Just barely above the ridge point (1.06$\times$). Each expert processes only $T/E = 49$ tokens instead of 196, reducing the tensor sizes and therefore the arithmetic intensity. More experts (larger $E$) pushes expert GEMMs further into the memory-bound regime.
-
-\textbf{Router gate (AI 1.9):} 11$\times$ \emph{below} the ridge point. The router is a tiny matrix multiply (384$\times$4) over 1,568 tokens---it moves barely any data but can only saturate 1.9/21.4 = 9\% of the memory bus. This means the router is \emph{extremely} memory-bound: no amount of compute optimisation helps; the only way to improve it is to reduce memory accesses (e.g., fusing router inference with the preceding attention layer).
-
-\textbf{Token sort (AI 1.0) and all-to-all (AI 0.1):} Both are essentially pure data movement with negligible arithmetic. They are hard upper bounds on dispatch overhead.
-
-\textbf{Key takeaway}: Engineering effort on expert GEMM kernels (already close to compute ceiling) has limited return. The roofline analysis directly identifies \emph{router inference fusion} and \emph{scatter-gather elimination} as the highest-leverage optimisation targets.
-
-%─────────────────────────────────────────────────────────────────────────────
-\subsection{Novel Module Evaluation}
-\label{sec:novel}
-
-\begin{table}[htbp]
-\caption{Novel Module Results with Baseline Comparison}
-\label{tab:novel}
-\centering
-\small
-\resizebox{\columnwidth}{!}{%
-\begin{tabular}{p{2.1cm}p{1.8cm}p{2.3cm}p{2.3cm}l}
-\toprule
-\textbf{Module} & \textbf{Baseline} & \textbf{Baseline metric} & \textbf{Novel metric} & \textbf{Result} \\
-\midrule
-ALFRouter & LinearRouter & Skew 2.204; lat 0.638 ms & Skew 2.184; lat 0.572 ms & $\downarrow$ skew, $\downarrow$ latency \\
-stream\_fine & Grouped disp. & 2.395 ms/batch & 2.545 ms/batch & Overhead (GTX 960 SM) \\
-DisaggregatedSim & Serial co-located & 1.965 ms total & 5.047 ms total & $\Delta{=}3.08$ ms PCIe \\
-\bottomrule
-\end{tabular}
-}
-\end{table}
-
-\textbf{ALFRouter:} Standard routers trained with cross-entropy loss develop uneven expert assignment (hotness skew = 2.204 means the busiest expert receives 2.2$\times$ the average token count). Auxiliary loss methods add a load-balance penalty $\lambda_\text{aux} H(\bar{p})$ to the training objective, but require manual tuning of $\lambda_\text{aux}$. ALFRouter instead maintains a per-expert bias $b_e$ updated online proportionally to how much expert $e$'s load deviates from capacity. This produces skew $= 2.184$ (marginal improvement of 0.9\%) and reduces routing latency by 10.3\% (0.638$\to$0.572 ms) by eliminating the auxiliary loss backward pass overhead during router fitting.
-
-\textbf{stream\_fine:} On the GTX 960 (1,024 CUDA cores, 8 streaming multiprocessors), allocating one stream per expert ($E{=}4$ streams) introduces overhead from CUDA context switching between streams. The 6.3\% latency increase (2.395$\to$2.545 ms) reflects this overhead. On data-centre GPUs with 60+ SMs (e.g., A100), per-expert stream overhead amortises across more concurrent warps and the benefit of fine-grained overlap is expected to outweigh the setup cost.
-
-\textbf{DisaggregatedSim:} The 5.047 ms total disaggregated latency vs.\ 1.965 ms co-located confirms that PCIe round-trip penalty ($\Delta{=}3.08$ ms) exceeds the expert GEMM compute time (1.965 ms baseline includes routing + expert). This 1.57$\times$ overhead motivates pipelining: overlapping batch $i$'s PCIe transfer with batch $i{-}1$'s GPU computation would theoretically recover most of the 3.08 ms penalty at sufficient batch depth.
-
-\subsection{Ablation Study}
+\subsection{Layer-Selection Ablation (L0--L10)}
 \label{sec:ablation}
 
-\textbf{What this tests:} The sensitivity of CLEAR-MoE++ performance to six independently varied design choices.
+Table~\ref{tab:ablation} compares all 11 layer-selection strategies on the same MoE configuration ($E{=}4$, $k{=}6$ of 12 FFN layers, composite scoring).
 
-\textbf{How it was done:} 24 configuration cells were evaluated, each performing a complete end-to-end run (calibration $\to$ scoring $\to$ extraction $\to$ router fitting $\to$ evaluation on 3,885 validation images). Each cell records Top-1 accuracy and p50 latency.
-
-\begin{table}[htbp]
-\caption{Ablation Study: Configuration Axes, Values, and Key Findings}
+\begin{table}[!t]
+\caption{Complete layer-selection ablation (L0--L10). All: DeiT-Small, $E{=}4$, $k{=}6$ layers, linear router, 200-image calibration. L1 avg of 3 seeds. $\Delta$ relative to L0.}
 \label{tab:ablation}
 \centering
 \small
+\setlength{\tabcolsep}{3pt}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{p{2.0cm}p{3.2cm}p{2.8cm}}
+\begin{tabular}{llllrr}
 \toprule
-\textbf{Axis} & \textbf{Values Tested} & \textbf{Finding} \\
+\textbf{ID} & \textbf{Strategy} & \textbf{Layers} & \textbf{Top-1} & $\boldsymbol{\Delta}$\textbf{pp} & \textbf{p50 ms} \\
 \midrule
-Layer strategy & \texttt{last\_half}, \texttt{score\_top\_k}, \texttt{all\_layers}, \texttt{alternating} & \texttt{last\_half} most stable; all-layer adds overhead with no accuracy gain \\
-Expert count $E$ & 2, 4, 8, 16 & $E{=}4$ optimal quality-speed; $E{=}16$ adds dispatch cost disproportionately \\
-Basis rank $r$ & 8, 16, 32, 64, 128 & Higher rank preserves more shared structure; diminishing returns beyond $r{=}64$ \\
-Router depth & 0 (linear), 1 (MLP-1), 2 (MLP-2) & Depth-1 MLP best balance of capacity and gate overhead \\
-Calibration size & 50, 200, 500, 2,000 & 200 images sufficient; negligible gain beyond; 50 degrades clustering \\
-MoE architecture & flat\_hard, hmoe, soft, elastic & Soft and elastic most reliable; hard requires router pre-training \\
+L0  & Dense (no MoE)    & --           & 86.73\%          & $+$0.00 & 57.0 \\
+L1  & Random ($n{=}3$)  & varies       & 86.72$\pm$0.01\% & $-$0.01 & 78.5$\pm$0.8 \\
+L2  & First $k$         & 0--5         & 86.60\%          & $-$0.13 & 79.3 \\
+L3  & Last $k$          & 6--11        & 86.68\%          & $-$0.05 & 80.3 \\
+L4  & Alternating (odd) & 1,3,5,7,9,11 & 86.83\%         & $+$0.10 & 87.2 \\
+L5  & Sparsity only     & 0,1,3,4,5,10 & 86.73\%         & $+$0.00 & 99.1 \\
+L6  & Clusterability    & 1,2,3,5,6,7  & 86.73\%         & $+$0.00 & 88.8 \\
+L7  & High-sensitivity  & 0,1,7,8,9,10 & 86.65\%         & $-$0.08 & 102.5 \\
+L8  & Sp.+Cl.           & 0,1,4,5,6,10 & 86.62\%         & $-$0.10 & 88.8 \\
+L9  & Cl.$-$Se.         & 2,3,4,5,6,11 & 86.68\%         & $-$0.05 & 94.0 \\
+\textbf{L10} & \textbf{Composite (ours)} & \textbf{1--6} & \textbf{86.68\%} & $\boldsymbol{-}$\textbf{0.05} & \textbf{82.4} \\
 \bottomrule
 \end{tabular}
 }
 \end{table}
 
-\textbf{Layer strategy:} \texttt{last\_half} selects blocks 6--11 based on the calibration score. \texttt{all\_layers} expertises all 12 FFN blocks, adding routing overhead at every block without proportional accuracy benefit---consistent with AdaMV-MoE's empirical finding that early layers learn universal features unsuitable for routing \cite{chen2023adamvmoe}. \texttt{alternating} (expertise every other layer) is stable but misses the highest-scoring late layers. \texttt{score\_top\_k} selects the top-$k$ layers by score directly; for $k{=}6$ it produces the same selection as \texttt{last\_half} on DeiT-Small.
+All 11 policies span only 0.21\,pp (86.62--86.83\%), confirming that \emph{accuracy is policy-insensitive}. The shared basis preserves quality regardless of which 6 blocks are expertized. The composite score's practical value is principled block~0 exclusion (sensitivity\,=\,0.946): L2 (first-$k$) includes block~0 and incurs the worst $-$0.13\,pp drop. L10 avoids it, achieving 82.4\,ms, comparable to L3 (last-$k$, 80.3\,ms) while additionally excluding high-sensitivity blocks. L7 (high-sensitivity, deliberately selecting the most sensitive blocks as a stress-test baseline) achieves only $-$0.08\,pp accuracy loss but is the slowest policy at 102.5\,ms, demonstrating that layer choice affects latency more than accuracy.
 
-\textbf{Expert count $E$:} $E{=}4$ provides 42.18\% active-parameter reduction with stable accuracy. $E{=}16$ with fixed $k{=}1$ routing reduces active parameters more aggressively but each expert receives only $\sim$12 calibration tokens on average, producing poor residual estimates.
+\subsection{Dispatch Strategy Benchmark}
 
-\textbf{Calibration size:} 50-image calibration yields degraded Silhouette scores ($< 0.3$) for $k$-means clustering due to insufficient token coverage per class. 200 images provides stable clustering (Silhouette 0.542) with negligible gain at 500 or 2,000.
+We benchmark three CUDA backends ($B{=}8$, $T{=}1568$, $E{=}4$, GTX\,960) under four imbalance levels (Table~\ref{tab:dispatch_main}). At balanced load, cuBLAS peaks at 728\,K\,tok/s (2.79$\times$ CPU serial). At 80\% imbalance, padding waste collapses cuBLAS to 558\,K\,tok/s ($-$23\%). Grouped dispatch remains stable at 665--747\,K\,tok/s across all imbalance levels. \textbf{Recommendation}: cuBLAS for predictably balanced load; Grouped otherwise.
 
-%─────────────────────────────────────────────────────────────────────────────
-\section{Discussion and Limitations}
+
+\begin{table}[!t]
+\caption{Dispatch micro-benchmark: 0\% vs.\ 80\% imbalance ($B{=}8$, $T{=}1568$, $E{=}4$, GTX\,960).}
+\label{tab:dispatch_main}
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{lrrrr}
+\toprule
+& \multicolumn{2}{c}{\textbf{0\% imb.}} & \multicolumn{2}{c}{\textbf{80\% imb.}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+\textbf{Backend} & ms & K\,tok/s & ms & K\,tok/s \\
+\midrule
+CPU Serial & 6.01 & 261 & 5.96 & 263 \\
+Naive      & 3.67 & 428 & 3.59 & 437 \\
+Grouped    & 2.36 & \textbf{665} & 2.14 & \textbf{733} \\
+cuBLAS     & \textbf{2.15} & \textbf{728} & 2.81 & 558 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Roofline Analysis}
+
+Fig.~\ref{fig:roofline} places each CLEAR-MoE operation on the GTX\,960 roofline (peak FP32: 2.4\,TFLOP/s, BW: 112\,GB/s, ridge: 21.4\,FLOPs/B). Dense FFN (AI\,=\,74.3) and expert GEMMs (AI\,=\,22.7) are compute-bound. The router gate (AI\,=\,1.9) and token sort (AI\,=\,1.0) are \emph{both} deep in the memory-bound regime: 11$\times$ and 21$\times$ below the ridge point. This indicates that routing and token sort are strongly memory-bound (11--21$\times$ below the ridge point), making fused dispatch kernels a plausible high-leverage optimization. Expert GEMMs are already near the compute ceiling and offer diminishing returns.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/roofline.pdf}
+\caption{Roofline for GTX\,960. Blue = compute-bound; orange/red = memory-bound. Router gate (AI\,=\,1.9) is 11$\times$ below the ridge point (21.4\,FLOPs/B); routing, not expert arithmetic, is the primary latency bottleneck.}
+\label{fig:roofline}
+\end{figure}
+
+\subsection{Hyperparameter Sensitivity}
+
+We ablate SVD rank, expert count, router architecture, calibration size, and random seed (Table~\ref{tab:sensitivity_main}); findings are:
+
+\begin{table}[!t]
+\caption{Hyperparameter sensitivity summary (DeiT-Small, Imagenette). All ranges $\leq$0.41\,pp.}
+\label{tab:sensitivity_main}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{llrr}
+\toprule
+\textbf{Study} & \textbf{Range tested} & \textbf{Top-1 span} & $\boldsymbol{\Delta}$\textbf{pp} \\
+\midrule
+SVD rank $r$   & 16--256           & 86.62--86.75\%           & 0.13 \\
+Expert count $E$ & 2--16           & 86.39--86.80\%$^*$       & 0.41 \\
+Router arch.   & Lin/MLP/Adaptive  & \textbf{86.68\%} (all)   & 0.00 \\
+Calibration $N$ & 50--500          & 86.55--86.70\%           & 0.15 \\
+Random seed    & 42/123/456        & 86.70$\pm$0.02\%         & 0.05 \\
+\bottomrule
+\multicolumn{4}{l}{\footnotesize $^*E{\in}\{2,4,8\}$ spans 0.15\,pp; $E{=}16$ drops 0.26\,pp (calibration instability: 200 images insufficient for 16 clusters).}
+\end{tabular}
+}
+\end{table}
+
+\textbf{SVD rank} ($r \in \{16, 32, 64, 96, 128, 192, 256\}$): accuracy range is 86.62--86.75\% (0.13\,pp). Reconstruction error decreases monotonically from 0.91 to 0.29, but this improvement does not translate to accuracy. Even $r{=}16$ captures the shared basis sufficiently.
+
+\textbf{Expert count} ($E \in \{2, 4, 8, 16\}$): accuracy is 86.65--86.80\% for $E\in\{2,4,8\}$; $E{=}16$ drops 0.26\,pp as 200 calibration images provide insufficient statistics to estimate 16 fine-grained clusters. Latency grows $\sim$9\,ms per doubling of $E$ (73\,ms at $E{=}2$ to 98\,ms at $E{=}16$). No empty experts appear at any count.
+
+\textbf{Router architecture}: all three routers (Linear, MLP, Adaptive) achieve identical 86.68\% Top-1. MLP routing accuracy reaches 0.980 vs.\ 0.925 for Linear, a 5.5\,pp improvement in routing precision with zero downstream benefit. The gap between random routing (D4/D5, Table~\ref{tab:cls}) and all learned routers is at most 0.06\,pp (roughly two changed predictions out of 3,925). While this numerically exceeds the 3-seed standard deviation of $\pm$0.02\,pp (Table~\ref{tab:sensitivity_main}, row ``Random seed''), a paired significance test would be needed to confirm a reliable effect; we treat 0.06\,pp as practically negligible. Fig.~\ref{fig:expert_entropy} provides a mechanistic view: despite D6 (learned router) reducing mean per-token routing entropy $3.5\times$ versus D5 (random, $\ln 4{\approx}1.386$\,nats), the accuracy impact is negligible.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/expert_entropy.pdf}
+\caption{Mean per-token routing entropy (nats) per expertized layer. Dashed red = D5 (random routing, max entropy $\ln 4{\approx}1.386$). Blue bars = D6 (learned linear router, mean ${\approx}0.40$\,nats). Despite $3.5\times$ entropy reduction, the D5-vs-D6 accuracy gap is only 0.06\,pp, confirming that routing confidence does not drive accuracy; the shared SVD basis does.}
+\label{fig:expert_entropy}
+\end{figure}
+
+Fig.~\ref{fig:router_scatter} plots accuracy gap against router training across 13 configurations (D5 at $x{=}0$, no trained router); no strong monotonic relationship is visible, consistent with the hypothesis that shared-basis quality governs accuracy regardless of routing quality.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/router_scatter.pdf}
+\caption{Accuracy gap ($\Delta$pp relative to dense) vs.\ router training across 13 configurations. D5 (random, no trained router) at $x{=}0$; D6 and cross-backbone routers at measured routing accuracy. No strong monotonic relationship is visible, consistent with the hypothesis that shared-basis quality governs accuracy regardless of routing precision.}
+\label{fig:router_scatter}
+\end{figure}
+
+\textbf{Calibration size} ($N \in \{50, 100, 200, 500\}$, multiple subsets for $N{<}500$): accuracy spans 86.55--86.70\% across all sizes; $N{=}50$ yields 86.65--86.70\% (within 0.15\,pp of $N{=}500$). Router accuracy climbs from 0.83 to 0.95 as $N$ grows, without accuracy benefit.
+
+\textbf{Reproducibility}: 86.70\,$\pm$\,0.02\% Top-1 across seeds 42, 123, 456 (full pipeline, composite scoring, $E{=}4$, $N{=}200$).
+
+\subsection{Cross-Backbone Generalization}
+\label{sec:cross_backbone}
+
+Table~\ref{tab:multibackbone} tests whether the shared-basis finding extends across architectures. We apply the full CLEAR-MoE pipeline to five backbones spanning 5.7--86.6\,M parameters and two pretraining lineages (DeiT, ViT); all other settings are identical to the DeiT-S ablation ($E{=}4$, $N{=}200$, seed\,42).
+
+\begin{table}[!t]
+\caption{Cross-backbone generalization (Imagenette, $E{=}4$, $N{=}200$, seed\,42). D5\,=\,random routing; D6\,=\,learned linear router. $|\Delta|{\leq}0.10$\,pp across all 10 configurations.}
+\label{tab:multibackbone}
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Backbone} & \textbf{Params} & \textbf{Dense} & \textbf{D5\,$\Delta$\,pp} & \textbf{D6\,$\Delta$\,pp} & \textbf{D6 Rtr.\ Acc} & \textbf{D6 Skew} \\
+\midrule
+DeiT-T/16 & 5.7\,M  & 75.92\% & $-$0.05 & $+$0.05$^{\dagger}$ & 0.913 & 0.090 \\
+DeiT-S/16 & 22.1\,M & 86.73\% & $-$0.10 & $-$0.05              & 0.925 & 0.099 \\
+ViT-S/16  & 22.1\,M & 76.23\% & $-$0.05 & $-$0.03              & 0.956 & 0.139 \\
+DeiT-B/16 & 86.6\,M & 91.77\% & $-$0.03 & $\pm$0.00            & 0.927 & 0.094 \\
+ViT-B/16  & 86.6\,M & 85.38\% & $-$0.08 & $-$0.10$^{\ddagger}$ & 0.967 & 0.150 \\
+\bottomrule
+\multicolumn{7}{l}{\footnotesize $^{\dagger}$Single-seed result for this backbone; per-backbone seed variance not characterised.} \\
+\multicolumn{7}{l}{\footnotesize $^{\ddagger}$Highest load skew (0.150); see Discussion.}
+\end{tabular}
+}
+\end{table}
+
+\textbf{Routing differences are numerically small.} Learned routing (D6) provides a marginal numerical advantage over random routing (D5) in 4 of 5 backbones; however, the per-backbone improvements range from 0.02 to 0.10\,pp, too small to confirm without paired significance testing. The one exception is ViT-B/16, where D5 ($-$0.08\,pp) outperforms D6 ($-$0.10\,pp): The ViT-B result coincides with the highest observed load skew (0.150, vs.\ 0.094 for DeiT-B), which may contribute to the difference; no ablation was performed to confirm a causal link. Taken together, these results are consistent with the hypothesis that routing quality has limited impact once the shared SVD basis is present; a definitive claim would require paired prediction-level testing across additional seeds. Fig.~\ref{fig:backbone_comparison} visualises all 10 configurations.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/backbone_comparison.pdf}
+\caption{Accuracy $\Delta$ vs.\ dense for five ViT backbones under D5 (random) and D6 (learned linear) routing (Imagenette, $E{=}4$, $N{=}200$, seed\,42). All deltas within $|\Delta|{\leq}0.10$\,pp. D6 provides marginal numerical advantage in 4 of 5 backbones; D5 outperforms D6 only on ViT-B (highest load skew, 0.150).}
+\label{fig:backbone_comparison}
+\end{figure}
+
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+\section{Discussion}
 \label{sec:discussion}
 
-\textbf{Quality vs.\ latency tradeoff.} CLEAR-MoE++ achieves 99.8\% accuracy retention with a 1.84$\times$ latency overhead over dense inference on the GTX 960. This overhead is not an inherent property of the extraction method---it reflects the memory-bound nature of routing and scatter-gather on bandwidth-limited consumer hardware. The roofline analysis quantifies that the GPU's 112 GB/s bandwidth is the binding constraint for routing (AI 1.9) and token movement (AI 1.0). An A100 GPU with 2 TB/s bandwidth would reduce routing overhead by up to 18$\times$, potentially inverting the latency comparison.
+\textbf{Why routing differences are small.} All residual experts are scalar-conditioned variants of the same matrix $(W_2 - W_\text{shared})$, so mis-routing changes only the scaling factor applied to a token's correction, not its direction. The 0.06\,pp gap between random and learned routing is the direct consequence. Cross-backbone results (Table~\ref{tab:multibackbone}) are consistent across 4 of 5 architectures; a linear router ($<$10K parameters) appears adequate. Expert Choice routing \cite{zhou2022expertchoice}, where experts select their tokens rather than the reverse, achieves better load balance in language models; on DeiT-S, however, random and learned routing differ by at most 0.06\,pp, and all cross-backbone random-routing losses remain within 0.10\,pp of dense, supporting the hypothesis that routing strategy is secondary to decomposition quality.
 
-\textbf{Hard routing accuracy gap.} Hard CLEAR-MoE achieves 86.51\% Top-1---a 0.18 point drop that represents 84.14\% accuracy retention when measured relative to the gap between random (10\%) and dense (86.69\%) performance. The gap arises from routing errors in the hard top-1 assignment: a token occasionally routed to its second-best expert produces a noisy residual that accumulates over 6 expertised layers. Router pre-training on more data or knowledge distillation from the dense model's predictions would address this.
+\textbf{Why CLEAR-MoE is slower on the GTX\,960.} CLEAR-MoE FFN computes shared fc1+fc2 on \emph{all} tokens, then adds residual paths that each process $T/E$ tokens but collectively span all $T$ tokens across $E$ experts, adding approximately one full fc2-equivalent computation. Total arithmetic is $\approx\!1.5\times$ dense FFN. On a bandwidth-limited GPU (112\,GB/s vs.\ 2\,TB/s for an A100), loading shared weights and expert-residual weights across memory dominates. The dispatch micro-benchmark isolates this: routing and token sort (AI\,=\,1.0--1.9) are 11--21$\times$ below the compute ridge. Disjoint experts (D2/D7) are faster (48\,ms) by eliminating shared paths, but sacrifice 21\,pp accuracy. Analytical modelling suggests $\geq$800\,GB/s bandwidth may be needed for latency parity; A100 (2\,TB/s) or H100 (3.35\,TB/s) class hardware are the plausible candidates.
 
-\textbf{Segmentation transfer specificity.} SF-B2's zero-layer extraction under \texttt{depth0} scoring reveals a limitation of the current scoring function: it assumes a flat FFN structure, but SegFormer-B2's MixFFN uses depth-wise convolution with significantly different activation distributions. Architecture-specific calibration metrics (e.g., convolutional activation clustering) are needed to extend CLEAR-MoE++ to hierarchical backbones.
+\textbf{Practical design guidelines.}
+\emph{When to use CLEAR-MoE.} CLEAR-MoE may be well suited when accuracy preservation is non-negotiable and backbone fine-tuning is infeasible: the evaluated DeiT and ViT backbones can be converted with 200 calibration images and no GPU cluster. The method is not competitive with disjoint-expert approaches if latency reduction is the primary goal on consumer hardware.
 
-\textbf{PCIe overhead and disaggregated serving.} The measured 3.08 ms PCIe penalty per batch means disaggregated inference is cost-effective only when batch size exceeds $\sim$32 images (at which point the 5.04 ms PCIe round-trip cost amortises below the marginal latency per image). For single-image interactive inference, co-located GPU execution is strictly preferable.
+\emph{Choosing $E$ and $r$.} Expert count $E{=}4$ provides a reasonable empirical trade-off: accuracy remains stable from $E{=}2$ to $E{=}8$, and $E{=}4$ balances router overhead with residual expressiveness. For $E{=}16$, our analytical model suggests $\geq$800 calibration images may be needed for stable cluster estimates; this was not directly validated. SVD rank $r$ can be set as low as 16 without consistent measured accuracy reduction on Imagenette; the default $r{=}d/2{\approx}192$ for DeiT-Small is conservative and may waste compute on deep layers.
 
-\textbf{Simulated parallelism.} EP/DP/PP results are obtained from synthetic communication models, not actual NCCL-based distributed execution. Real-world results will differ due to NCCL protocol overhead, NIC hardware, and network topology. These results should be treated as order-of-magnitude guidance rather than deployment-ready benchmarks.
+\emph{Choosing the dispatch backend.} cuBLAS is optimal only for perfectly balanced expert load, which is common in classification but rare in detection/segmentation. For workloads with variable token-to-expert ratios, Grouped dispatch is approximately 31\% faster than cuBLAS at 80\% imbalance and remains comparatively stable across imbalance levels. Naive dispatch is a reference implementation only and is not recommended for latency-sensitive deployment.
 
-%─────────────────────────────────────────────────────────────────────────────
+\textbf{Limitations.}
+\emph{Backbone and dataset scope.} DeiT-T/S/B and ViT-S/B generalization is confirmed (Table~\ref{tab:multibackbone}); ViT-L, ImageNet-1K, and hierarchical backbones (Swin, ConvNeXt) are not evaluated. Parameter count, memory footprint, and FLOPs versus a same-hardware baseline are not reported.
+
+\emph{Hardware and compute.} CLEAR-MoE is 1.3--1.7$\times$ slower than dense on GTX\,960 (112\,GB/s). Latency parity on high-bandwidth hardware is modelled analytically only; multi-device projections are simulated (PCIe Gen3$\times$16), not measured NCCL runs.
+
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 \section{Conclusion}
 \label{sec:conclusion}
 
-CLEAR-MoE++ demonstrates that post-training expert extraction from vision transformers can produce conditional sparse-compute backbones that preserve near-full accuracy on both classification and semantic segmentation without any backbone retraining. The four-phase pipeline (calibration scoring $\to$ SVD+$k$-means decomposition $\to$ router fitting $\to$ dispatch deployment) is modular, reproducible on a single consumer GPU, and accompanied by a comprehensive systems evaluation.
+CLEAR-MoE demonstrates that post-training expert extraction preserves ${\geq}99.9$\% of dense ViT accuracy via a shared SVD basis plus per-cluster residuals, requiring only 200 calibration images and a single consumer GPU. This finding is consistent across five ViT backbones spanning 5.7--86.6\,M parameters and two pretraining lineages (Table~\ref{tab:multibackbone}), providing preliminary cross-backbone support for the shared-basis hypothesis.
 
-The core contributions establish three important findings:
+\textbf{Central finding.} The shared SVD basis is the dominant accuracy-preserving component. Routing quality, SVD rank, expert count ($E\in\{2,4,8\}$), and calibration size ($N\in\{50,\ldots,500\}$) are all secondary. Random routing achieves 86.62\%, while learned routing at 98\% accuracy achieves 86.68\%, a 0.06\,pp difference whose statistical reliability would require paired testing to confirm. This simplifies the design space: a 10K-parameter linear router appears sufficient when the shared basis is used. Future extraction work should invest in decomposition quality rather than router expressiveness.
 
-\begin{enumerate}
-\item \textbf{Layer selectivity works}: Expertising only the top-scoring late-stage FFN layers (blocks 6--11) achieves the same 86.51\% Top-1 as all-layer expertisation while reducing routing overhead, validating the adaptive layer-scoring function.
+\textbf{Latency finding.} On a bandwidth-constrained GTX\,960 (112\,GB/s), CLEAR-MoE FFN is 1.3--1.7$\times$ slower than dense because the shared basis forces loading shared weights for \emph{all} tokens. Roofline analysis confirms routing and scatter-gather (AI\,=\,1.0--1.9) are 11--21$\times$ below the ridge point while expert GEMMs (AI\,=\,22.7) are near the compute ceiling. Fused dispatch kernels, not expert arithmetic optimizations, are therefore the most plausible high-leverage engineering target.
 
-\item \textbf{Dispatch strategy determines wall-clock performance}: cuBLAS batched-GEMM (18.63$\times$ over CPU serial) and Triton scatter-gather (imbalance-agnostic at 176--181k tok/s) are the practical winners, but the crossover at 40--60\% imbalance means production systems should implement dynamic dispatch switching.
+\textbf{Future directions.} Evaluate CLEAR-MoE on ViT-L and ImageNet-1K to assess scaling beyond the five backbones validated here. Implement Triton-fused router-dispatch kernels to reduce scatter-gather overhead below the memory-bound bottleneck. Extend the composite layer-scoring criterion to hierarchical backbones (Swin, ConvNeXt) where FFN widths are non-uniform across stages. Empirically evaluate CLEAR-MoE on high-bandwidth hardware (A100/H100 class) to determine whether the projected latency parity materialises in practice.
 
-\item \textbf{PCIe overhead quantified}: DisaggregatedSim precisely measures the CPU-router + GPU-expert round-trip at 5.04 ms per batch ($\Delta{=}3.08$ ms net PCIe penalty), establishing that batch-level pipelining is a prerequisite for practical disaggregated inference.
 
-\item \textbf{Dispatch, not GEMM, is the bottleneck}: Roofline analysis reveals that router inference (AI 1.9) and token sorting (AI 1.0) are an order-of-magnitude more memory-bound than expert GEMMs (AI 22.7), making fused dispatch kernels the highest-leverage future engineering target.
-\end{enumerate}
-
-Future work should prioritise: (1) a single fused Triton kernel combining router inference + scatter + grouped GEMM + gather to eliminate all Python-layer dispatch overhead; (2) NCCL-based real multi-GPU expert parallelism replacing the current simulation; (3) MixFFN-specific layer scoring enabling SF-B2 and larger hierarchical backbone extraction; (4) batch-level PCIe transfer pipelining to amortise the 3.08 ms disaggregation penalty; and (5) router pre-training via knowledge distillation from the dense model to close the hard-routing accuracy gap.
-
-%─────────────────────────────────────────────────────────────────────────────
-\section*{Acknowledgment}
-
-The authors thank the PyTorch, Hugging Face Transformers, and timm communities for providing pretrained checkpoints and framework components. All experiments were conducted on consumer hardware to maximise accessibility and reproducibility.
-
-Complete implementation details and reproducible code are available at \url{https://github.com/irtiza1999/Clear_Moe}.
-
-%─────────────────────────────────────────────────────────────────────────────
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+% \IEEEtriggeratref{N}  % uncomment and tune N if refs still spill to page 7 after removing \clearpage
 \balance
 \begin{thebibliography}{00}
 
 \bibitem{dosovitskiy2021vit}
 A.~Dosovitskiy et al., ``An image is worth 16$\times$16 words: Transformers for image recognition at scale,'' in \textit{Proc.\ ICLR}, 2021.
-
-\bibitem{liu2021swin}
-Z.~Liu et al., ``Swin Transformer: Hierarchical vision transformer using shifted windows,'' in \textit{Proc.\ ICCV}, pp.~10012--10022, 2021.
 
 \bibitem{shazeer2017outrageously}
 N.~Shazeer et al., ``Outrageously large neural networks: The sparsely-gated mixture-of-experts layer,'' in \textit{Proc.\ ICLR}, 2017.
@@ -1089,23 +417,17 @@ Y.~Rao et al., ``DynamicViT: Efficient vision transformers with dynamic token sp
 \bibitem{yin2022avit}
 A.~Yin et al., ``A-ViT: Adaptive tokens for efficient vision transformer,'' in \textit{Proc.\ CVPR}, pp.~10809--10818, 2022.
 
-\bibitem{fan2022m3vit}
-C.~Fan et al., ``M$^3$ViT: Mixture-of-experts vision transformer for efficient multi-task learning with model-accelerator co-design,'' in \textit{Proc.\ NeurIPS}, 2022.
-
 \bibitem{chen2023adamvmoe}
 Y.~Chen et al., ``AdaMV-MoE: Adaptive multi-task vision mixture-of-experts,'' in \textit{Proc.\ ICCV}, pp.~17346--17357, 2023.
 
-\bibitem{chen2023modsquad}
-Z.~Chen et al., ``Mod-Squad: Designing mixtures of experts as modular multi-task learners,'' in \textit{Proc.\ CVPR}, 2023.
-
 \bibitem{mone2024}
-G.~Hazimeh et al., ``Mixture of nested experts: Adaptive processing of visual tokens,'' in \textit{Proc.\ NeurIPS}, 2024.
+G.~Jain et al., ``Mixture of nested experts: Adaptive processing of visual tokens,'' in \textit{Proc.\ NeurIPS}, 2024.
 
 \bibitem{d2dmoe2024}
-S.~Muszy\'{n}ski et al., ``From dense to dynamic sparse: Post-training MoE conversion for vision transformers,'' in \textit{Proc.\ NeurIPS}, 2024.
+F.~Szatkowski et al., ``Exploiting activation sparsity with dense to dynamic-$k$ mixture-of-experts conversion,'' in \textit{Proc.\ NeurIPS}, 2024.
 
 \bibitem{berisha2025cvpr}
-V.~Berisha et al., ``Efficient data-driven MoE extraction from trained networks,'' in \textit{Proc.\ CVPR}, 2025.
+U.~Berisha et al., ``Efficient data-driven MoE extraction from trained networks,'' in \textit{Proc.\ CVPR}, 2025.
 
 \bibitem{zhang2022moefication}
 Z.~Zhang et al., ``MoEfication: Transformer feed-forward layers are mixtures of experts,'' in \textit{Findings of ACL}, pp.~877--890, 2022.
@@ -1114,26 +436,20 @@ Z.~Zhang et al., ``MoEfication: Transformer feed-forward layers are mixtures of 
 Y.~Hwang et al., ``Tutel: Adaptive mixture-of-experts at scale,'' in \textit{Proc.\ MLSys}, 2023.
 
 \bibitem{brainstorm2023}
-Z.~Cui et al., ``Brainstorm: Evaluating and improving the inference efficiency of dynamic neural networks,'' in \textit{Proc.\ OSDI}, 2023.
+W.~Cui et al., ``Optimizing dynamic neural networks with Brainstorm,'' in \textit{Proc.\ USENIX OSDI}, pp.~759--778, 2023.
 
 \bibitem{lancet2024}
-L.~Leteneur et al., ``Lancet: Accelerating mixture-of-experts training via whole graph computation-communication overlapping,'' in \textit{Proc.\ MLSys}, 2024.
+C.~Jiang et al., ``Lancet: Accelerating mixture-of-experts training via whole graph computation-communication overlapping,'' in \textit{Proc.\ MLSys}, 2024.
 
-\bibitem{dice2025}
-X.~Li et al., ``DICE: Staleness-aware optimizations for parallel diffusion MoE inference,'' in \textit{Proc.\ ICCV}, 2025.
+\bibitem{komatsuzaki2023sparse}
+A.~Komatsuzaki et al., ``Sparse upcycling: Training mixture-of-experts from dense checkpoints,'' in \textit{Proc.\ ICLR}, 2023.
 
-\bibitem{russakovsky2015imagenet}
-O.~Russakovsky et al., ``ImageNet large scale visual recognition challenge,'' \textit{Int.\ J.\ Comput.\ Vis.}, vol.~115, no.~3, pp.~211--252, 2015.
-
-\bibitem{cordts2016cityscapes}
-M.~Cordts et al., ``The Cityscapes dataset for semantic urban scene understanding,'' in \textit{Proc.\ CVPR}, pp.~3213--3223, 2016.
-
-\bibitem{peebles2023dit}
-W.~Peebles and S.~Xie, ``Scalable diffusion models with transformers,'' in \textit{Proc.\ ICCV}, pp.~4195--4205, 2023.
-
-\bibitem{xiao2023segformer}
-E.~Xie et al., ``SegFormer: Simple and efficient design for semantic segmentation with transformers,'' in \textit{Proc.\ NeurIPS}, vol.~34, 2021.
+\bibitem{zhou2022expertchoice}
+Z.~Zhou et al., ``Mixture-of-experts with expert choice routing,'' in \textit{Proc.\ NeurIPS}, 2022.
 
 \end{thebibliography}
 
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+%  APPENDIX
+%â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 \end{document}

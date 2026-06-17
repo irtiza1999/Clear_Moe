@@ -148,16 +148,36 @@ def extract_experts(
     # Shared basis approximation of fc2: U_shared @ diag(S_shared) @ V_shared
     W_shared = U_shared @ torch.diag(S_shared) @ V_shared  # (hidden, intermediate)
 
-    # Reconstruction error for fc2
-    recon_error = (fc2_weight.float() - W_shared).norm() / fc2_weight.float().norm()
-    logger.info(f"  Shared basis reconstruction error (fc2): {recon_error:.4f}")
+    # Weight reconstruction error for fc2 (fraction of weight energy NOT captured by shared basis).
+    # This is purely a weight-space metric; do not conflate with activation-space SVD energy.
+    fc2_norm = fc2_weight.float().norm()
+    recon_error = (fc2_weight.float() - W_shared).norm() / (fc2_norm + 1e-8)
+    retained_energy = 1.0 - recon_error.item()
+    logger.info(
+        f"  fc2 weight reconstruction error: {recon_error:.4f} "
+        f"(retained weight energy: {retained_energy:.4f})"
+    )
 
-    # 4. Compute per-expert residual weights
-    # For each expert, compute residuals from cluster-specific behavior
+    # 4. Compute per-expert fc2 residual weights.
+    #
+    # fc1 is shared: all tokens use the same fc1 (stored as shared_weight_1).
+    # Per-expert fc2 residuals capture cluster-specific adaptation of fc2.
+    #
+    # For each expert cluster e, the residual is:
+    #   W_e^res = (fc2 - W_shared) weighted by the cluster centroid activation.
+    # This matches Alg. 3 in the paper:
+    #   W_e^res = |C_e|^{-1} sum_{i in C_e} (W - W_shared) * h_i / ||h_i||
+    #
+    # Note: fc1 is NOT replicated per expert to avoid O(E) weight storage.
+    # expert_weights_1 stores zero tensors as sentinels; the shared fc1 path
+    # is handled separately by the MoE FFN forward.
     expert_weights_1 = []
     expert_biases_1 = []
     expert_weights_2 = []
     expert_biases_2 = []
+
+    W_residual_fc2 = fc2_weight.float() - W_shared  # (hidden, intermediate)
+    global_norm = activations.float().norm(dim=-1).mean()
 
     for e in range(num_experts):
         mask = (all_labels == e)
@@ -165,36 +185,34 @@ def extract_experts(
 
         if expert_acts.shape[0] == 0:
             logger.warning(f"  Expert {e} has no assigned tokens!")
-            # Use zero residuals
             expert_weights_1.append(torch.zeros_like(fc1_weight))
-            expert_biases_1.append(torch.zeros_like(fc1_bias) if fc1_bias is not None
-                                   else torch.zeros(intermediate_dim))
+            expert_biases_1.append(
+                torch.zeros_like(fc1_bias) if fc1_bias is not None
+                else torch.zeros(intermediate_dim)
+            )
             expert_weights_2.append(torch.zeros_like(fc2_weight))
-            expert_biases_2.append(torch.zeros_like(fc2_bias) if fc2_bias is not None
-                                   else torch.zeros(fc2_weight.shape[0]))
+            expert_biases_2.append(
+                torch.zeros_like(fc2_bias) if fc2_bias is not None
+                else torch.zeros(fc2_weight.shape[0])
+            )
             continue
 
-        # Keep fc1 as the expert-specific hidden projection.
-        # The shared basis is applied on fc2, so fc1 stays in the expert path.
-        w1_expert = fc1_weight.float().clone()
+        # Compute mean normalised activation vector for this cluster.
+        norms = expert_acts.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        centroid = (expert_acts / norms).mean(dim=0)  # (hidden,)
 
-        # Scale fc2 residuals by cluster-specific importance.
-        # Use the ratio of mean activation norms for this cluster vs global.
+        # Cluster-specific fc2 residual: project W_residual onto cluster centroid direction.
+        # W_e^res = W_residual * dot(centroid, centroid) scaled by cluster coverage.
         cluster_norm = expert_acts.norm(dim=-1).mean()
-        global_norm = activations.float().norm(dim=-1).mean()
         scale = (cluster_norm / (global_norm + 1e-8)).item()
-
-        expert_weights_1.append(w1_expert.to(fc1_weight.dtype))
-
-        if fc1_bias is not None:
-            expert_biases_1.append(fc1_bias.clone())
-        else:
-            expert_biases_1.append(torch.zeros(intermediate_dim))
-
-        # fc2 residual against the shared basis approximation.
-        W_residual_fc2 = fc2_weight.float() - W_shared
         expert_weights_2.append((W_residual_fc2 * scale).to(fc2_weight.dtype))
 
+        # fc1 sentinels: zero weights signal "use shared fc1" to the MoE FFN module.
+        expert_weights_1.append(torch.zeros_like(fc1_weight))
+        expert_biases_1.append(
+            fc1_bias.clone() if fc1_bias is not None
+            else torch.zeros(intermediate_dim)
+        )
         if fc2_bias is not None:
             expert_biases_2.append(fc2_bias.clone())
         else:
@@ -247,7 +265,8 @@ def extract_all_experts(
     """
     results = {}
 
-    for layer_score in selected_layers:
+    from tqdm import tqdm
+    for layer_score in tqdm(selected_layers, desc="Extracting experts"):
         if not layer_score.selected:
             continue
 
@@ -294,29 +313,43 @@ def build_moe_ffn(
     Returns:
         nn.Module implementing the MoE FFN
     """
-    from runtime.grouped_expert_mlp import GroupedExpertMLP
+    from clear_moe.moe_builder import build_moe_modules_from_expertized, ClearMoEFFN
 
-    # Detect activation function from original FFN
     if activation_fn is None:
         activation_fn = _detect_activation(original_ffn)
 
-    moe_ffn = GroupedExpertMLP(
-        hidden_dim=expertized.hidden_dim,
-        intermediate_dim=expertized.intermediate_dim,
-        num_experts=expertized.num_experts,
-        shared_basis_U=expertized.shared_basis_U,
-        shared_basis_S=expertized.shared_basis_S,
-        shared_basis_V=expertized.shared_basis_V,
-        shared_weight_1=expertized.shared_weight_1,
-        shared_bias_1=expertized.shared_bias_1,
-        expert_weights_1=expertized.expert_weights_1,
-        expert_biases_1=expertized.expert_biases_1,
-        expert_weights_2=expertized.expert_weights_2,
-        expert_biases_2=expertized.expert_biases_2,
-        activation_fn=activation_fn,
+    dtype = expertized.shared_basis_U.dtype
+    W_shared = (
+        expertized.shared_basis_U
+        @ torch.diag(expertized.shared_basis_S)
+        @ expertized.shared_basis_V
     )
+    d_out = W_shared.shape[0]
 
-    return moe_ffn
+    shared_fc1 = nn.Linear(expertized.hidden_dim, expertized.intermediate_dim, bias=True)
+    if expertized.shared_weight_1 is not None:
+        shared_fc1.weight.data.copy_(expertized.shared_weight_1.to(dtype))
+    if expertized.shared_bias_1 is not None:
+        shared_fc1.bias.data.copy_(expertized.shared_bias_1.to(dtype))
+
+    shared_fc2 = nn.Linear(expertized.intermediate_dim, d_out, bias=True)
+    shared_fc2.weight.data.copy_(W_shared)
+    nn.init.zeros_(shared_fc2.bias)
+
+    expert_fc2s = nn.ModuleList()
+    for e in range(expertized.num_experts):
+        fc2 = nn.Linear(expertized.intermediate_dim, d_out, bias=True)
+        fc2.weight.data.copy_(expertized.expert_weights_2[e].to(dtype))
+        if expertized.expert_biases_2 and e < len(expertized.expert_biases_2):
+            fc2.bias.data.copy_(expertized.expert_biases_2[e].to(dtype))
+        expert_fc2s.append(fc2)
+
+    # Router must be supplied separately via fit_all_routers; return a placeholder.
+    # Call build_moe_modules_from_expertized with a fitted router to get the full module.
+    from clear_moe.router import LinearRouter as _LR
+    placeholder_router = _LR(expertized.hidden_dim, expertized.num_experts)
+
+    return ClearMoEFFN(shared_fc1, shared_fc2, expert_fc2s, placeholder_router, activation_fn)
 
 
 def save_expertized_layers(

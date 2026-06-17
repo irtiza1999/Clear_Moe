@@ -56,7 +56,7 @@ def score_layers(
     calib_loader=None,
     num_clusters: int = 4,
     sparsity_threshold: float = 0.01,
-    weights: Tuple[float, float, float] = (0.3, 0.4, 0.3),
+    weights: Tuple[float, float, float] = (0.4, 0.4, 0.2),
     max_samples_for_clustering: int = 5000,
 ) -> List[LayerScore]:
     """
@@ -107,8 +107,8 @@ def score_layers(
             num_layers = len(layer_infos)
             sensitivity = (info.layer_index + 1) / num_layers
 
-        # Composite score
-        composite = w_s * sparsity + w_m * multimodality + w_sens * sensitivity
+        # Composite score: sensitivity is subtracted (high sensitivity = riskier to expertize)
+        composite = w_s * sparsity + w_m * multimodality - w_sens * sensitivity
 
         scores.append(LayerScore(
             name=name,
@@ -406,18 +406,68 @@ def select_layers(
                 s.selected = True
 
     elif strategy == "score_top_k":
-        # Pure score-based top-k (no positional constraint)
         k = top_k or max(1, total_layers // 2)
-        # Sort by composite score descending and take top-k
         sorted_by_score = sorted(scores, key=lambda s: s.composite, reverse=True)
         for i, s in enumerate(sorted_by_score):
             if i < k:
                 s.selected = True
 
     elif strategy == "all_layers":
-        # Expertize all layers
         for s in scores:
             s.selected = True
+
+    elif strategy == "first_k":
+        k = top_k or max(1, total_layers // 2)
+        sorted_by_idx = sorted(scores, key=lambda s: s.layer_index)
+        for i, s in enumerate(sorted_by_idx):
+            if i < k:
+                s.selected = True
+
+    elif strategy == "last_k":
+        k = top_k or max(1, total_layers // 2)
+        sorted_by_idx = sorted(scores, key=lambda s: s.layer_index)
+        for s in sorted_by_idx[-k:]:
+            s.selected = True
+
+    elif strategy == "sparsity_only":
+        k = top_k or max(1, total_layers // 2)
+        sorted_by_sp = sorted(scores, key=lambda s: s.sparsity, reverse=True)
+        for i, s in enumerate(sorted_by_sp):
+            if i < k:
+                s.selected = True
+
+    elif strategy == "clusterability_only":
+        k = top_k or max(1, total_layers // 2)
+        sorted_by_mm = sorted(scores, key=lambda s: s.multimodality, reverse=True)
+        for i, s in enumerate(sorted_by_mm):
+            if i < k:
+                s.selected = True
+
+    elif strategy == "sensitivity_only":
+        k = top_k or max(1, total_layers // 2)
+        # Select most sensitive layers (high sensitivity = important layers)
+        sorted_by_se = sorted(scores, key=lambda s: s.sensitivity, reverse=True)
+        for i, s in enumerate(sorted_by_se):
+            if i < k:
+                s.selected = True
+
+    elif strategy == "sparsity_plus_clusterability":
+        k = top_k or max(1, total_layers // 2)
+        for s in scores:
+            s._temp_score = s.sparsity + s.multimodality
+        sorted_by_sc = sorted(scores, key=lambda s: s._temp_score, reverse=True)
+        for i, s in enumerate(sorted_by_sc):
+            if i < k:
+                s.selected = True
+
+    elif strategy == "clusterability_minus_sensitivity":
+        k = top_k or max(1, total_layers // 2)
+        for s in scores:
+            s._temp_score = s.multimodality - s.sensitivity
+        sorted_by_cs = sorted(scores, key=lambda s: s._temp_score, reverse=True)
+        for i, s in enumerate(sorted_by_cs):
+            if i < k:
+                s.selected = True
 
     else:
         raise ValueError(f"Unknown layer selection strategy: {strategy}")

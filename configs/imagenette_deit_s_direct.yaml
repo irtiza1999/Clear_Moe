@@ -1,0 +1,48 @@
+# CLEAR-MoE — DeiT-Small on ImageNette (direct data path, no preprocessing)
+model:
+  name: deit_small_patch16_224
+  source: timm
+  pretrained: true
+  num_classes: 10
+  input_size: 224
+
+data:
+  task: classification
+  dataset: imagenette
+  data_dir: data/imagenette2-320
+  calib_size: 200
+  val_batch_size: 8
+  num_workers: 2
+  pin_memory: false
+
+extraction:
+  num_experts: 4
+  layer_selection: last_half
+  method: clear_moe
+  shared_basis_rank: null
+
+router:
+  type: linear
+  hidden_dim: 64
+  lr: 1.0e-3
+  epochs: 5
+  weight_decay: 0.01
+  scheduler: cosine
+  balance_coeff: 0.01
+  adaptive_routing: false
+  confidence_threshold: 0.6
+
+runtime:
+  dtype: float32
+  routing: top1
+  route_sorting: true
+  dispatch_backend: grouped
+
+evaluation:
+  metrics: [top1, top5, latency_p50, latency_p95]
+  latency_warmup: 20
+  latency_iterations: 100
+
+seed: 42
+output_dir: outputs
+device: cuda

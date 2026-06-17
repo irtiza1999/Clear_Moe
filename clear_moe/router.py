@@ -217,6 +217,14 @@ def create_router(
         return LinearRouter(hidden_dim, num_experts)
     elif router_type == "mlp":
         return MLPRouter(hidden_dim, num_experts, router_hidden=router_hidden)
+    elif router_type == "adaptive":
+        return AdaptiveRouter(
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            confidence_threshold=confidence,
+            router_type="linear",
+            router_hidden=router_hidden,
+        )
     else:
         raise ValueError(f"Unknown router type: {router_type}")
 

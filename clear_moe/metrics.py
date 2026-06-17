@@ -60,36 +60,27 @@ def evaluate_classification(
     model.eval()
     correct = {k: 0 for k in top_k}
     total = 0
-
-    # Detect if model is 1000-class and we need mapping
-    # We check the last linear layer or the model's output shape
-    needs_mapping = False
-    
-    for images, targets in dataloader:
-        images = images.to(device)
-        outputs = model(images)
-        if hasattr(outputs, "logits"):
-            outputs = outputs.logits
-        if outputs.shape[1] == 1000 and targets.max() < 10:
-            needs_mapping = True
-        break
+    needs_mapping = None
 
     for images, targets in tqdm(dataloader, desc="Evaluating classification"):
         images = images.to(device)
         targets = targets.to(device)
 
-        if needs_mapping:
-            # Map 0-9 labels to ImageNet-1K indices
-            mapped_targets = torch.tensor(
-                [IMAGENETTE_TO_IMAGENET.get(t.item(), t.item()) for t in targets],
-                device=device
-            )
-        else:
-            mapped_targets = targets
-
         outputs = model(images)
         if hasattr(outputs, "logits"):
             outputs = outputs.logits
+
+        # Detect mapping need on first batch
+        if needs_mapping is None:
+            needs_mapping = (outputs.shape[1] == 1000 and targets.max() < 10)
+
+        if needs_mapping:
+            mapped_targets = torch.tensor(
+                [IMAGENETTE_TO_IMAGENET.get(t.item(), t.item()) for t in targets],
+                device=device,
+            )
+        else:
+            mapped_targets = targets
 
         batch_size = targets.shape[0]
         total += batch_size
@@ -99,7 +90,6 @@ def evaluate_classification(
             correct_k = preds.eq(mapped_targets.view(-1, 1).expand_as(preds)).any(dim=1)
             correct[k] += correct_k.sum().item()
 
-        # Free GPU memory
         del images, targets, outputs
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -167,21 +157,15 @@ def evaluate_segmentation(
         if targets.dim() == 4:
             targets = targets.squeeze(1)
 
-        # Update confusion matrix
-        valid = targets != ignore_index
+        # Update confusion matrix using bincount (correct and efficient)
         for pred, target in zip(preds, targets):
-            mask = valid if valid.dim() == pred.dim() else torch.ones_like(pred, dtype=torch.bool)
             if target.shape == pred.shape:
-                valid_mask = target != ignore_index
-                p = pred[valid_mask].long()
+                valid_mask = (target >= 0) & (target < num_classes) & (target != ignore_index)
+                p = pred[valid_mask].long().clamp(0, num_classes - 1)
                 t = target[valid_mask].long()
-                # Clamp to valid range
-                p = p.clamp(0, num_classes - 1)
-                t = t.clamp(0, num_classes - 1)
-                confusion += torch.zeros(num_classes, num_classes, dtype=torch.long).scatter_add(
-                    0,
-                    t.unsqueeze(1).expand(-1, num_classes),
-                    torch.zeros(t.shape[0], num_classes, dtype=torch.long).scatter(1, p.unsqueeze(1), 1),
+                combined = num_classes * t + p
+                confusion += torch.bincount(combined, minlength=num_classes * num_classes).reshape(
+                    num_classes, num_classes
                 )
 
         del images, logits
@@ -224,8 +208,8 @@ def measure_latency(
     model: nn.Module,
     input_shape: Tuple[int, ...],
     device: torch.device,
-    warmup: int = 10,
-    iterations: int = 50,
+    warmup: int = 20,
+    iterations: int = 100,
     dtype: torch.dtype = torch.float32,
 ) -> Dict[str, float]:
     """
@@ -274,6 +258,7 @@ def measure_latency(
         "latency_std_ms": float(np.std(latencies)),
         "latency_p50_ms": float(np.percentile(latencies, 50)),
         "latency_p90_ms": float(np.percentile(latencies, 90)),
+        "latency_p95_ms": float(np.percentile(latencies, 95)),
         "latency_p99_ms": float(np.percentile(latencies, 99)),
         "latency_min_ms": float(np.min(latencies)),
         "latency_max_ms": float(np.max(latencies)),
@@ -282,7 +267,7 @@ def measure_latency(
     logger.info(
         f"  Latency: mean={results['latency_mean_ms']:.2f}ms, "
         f"p50={results['latency_p50_ms']:.2f}ms, "
-        f"p90={results['latency_p90_ms']:.2f}ms"
+        f"p95={results['latency_p95_ms']:.2f}ms"
     )
 
     return results

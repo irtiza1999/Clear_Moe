@@ -30,15 +30,17 @@ logger = logging.getLogger(__name__)
 # Dataset loading
 # ──────────────────────────────────────────────────────────────────────
 
-def get_calibration_dataloader(config: Dict, transform=None) -> DataLoader:
+def get_calibration_dataloader(config: Dict, transform=None, seed: int = 42) -> DataLoader:
     """
     Build a calibration DataLoader from config.
 
-    Uses a subset of the training/validation data for activation capture.
+    Uses a subset of the training data for activation capture.
+    Subset selection uses a fixed seed for reproducibility.
 
     Args:
         config: Config dict with data section
         transform: Image transform (from get_model_input_transform)
+        seed: Random seed for reproducible subset selection
 
     Returns:
         DataLoader for calibration
@@ -48,14 +50,20 @@ def get_calibration_dataloader(config: Dict, transform=None) -> DataLoader:
     calib_size = data_cfg.get("calib_size", 2000)
     batch_size = data_cfg.get("val_batch_size", 4)
     num_workers = data_cfg.get("num_workers", 2)
+    seed = config.get("seed", seed)
 
     dataset = _load_dataset(dataset_name, split="train", config=config, transform=transform)
 
-    # Take a random subset for calibration
+    # Take a reproducible random subset for calibration (training split only)
     if len(dataset) > calib_size:
-        indices = torch.randperm(len(dataset))[:calib_size].tolist()
+        rng = torch.Generator()
+        rng.manual_seed(seed)
+        indices = torch.randperm(len(dataset), generator=rng)[:calib_size].tolist()
         dataset = Subset(dataset, indices)
-        logger.info(f"Using calibration subset of {calib_size} samples from {dataset_name}")
+        logger.info(
+            f"Using calibration subset of {calib_size} samples from {dataset_name} "
+            f"(seed={seed})"
+        )
     else:
         logger.info(f"Using full dataset of {len(dataset)} samples for calibration")
 
@@ -225,30 +233,37 @@ def _load_cityscapes(split: str, transform, config: Dict) -> Dataset:
     """
     Load Cityscapes dataset.
 
-    First tries local path, then HuggingFace datasets.
+    Tries (in order):
+    1. Local path from config key 'data_dir' or 'cityscapes_dir'
+       Note: torchvision.Cityscapes target_type="semantic" returns raw label
+       IDs (0-33), NOT training IDs (0-18). We convert via CityscapesLabelMapper.
+    2. Synthetic dataset (real Cityscapes requires manual download/license).
+
+    For a fully self-contained segmentation evaluation use
+    experiments/run_segmentation.py which evaluates ADE20K with the matching
+    ADE20K-finetuned SegFormer model (no manual download required).
     """
     data_cfg = config["data"]
-    local_dir = data_cfg.get("cityscapes_dir")
+    # Support both 'data_dir' and legacy 'cityscapes_dir' config keys
+    local_dir = data_cfg.get("data_dir") or data_cfg.get("cityscapes_dir")
 
     if local_dir and os.path.exists(local_dir):
         from torchvision.datasets import Cityscapes
         cs_split = "val" if split == "val" else "train"
-        return Cityscapes(
+        base_ds = Cityscapes(
             local_dir, split=cs_split, mode="fine",
             target_type="semantic", transform=transform,
         )
+        logger.info(f"Loaded Cityscapes from {local_dir} ({cs_split}): {len(base_ds)} images")
+        return CityscapesTrainIdDataset(base_ds)
 
-    # Try HuggingFace
-    try:
-        from datasets import load_dataset as hf_load
-        hf_split = "train" if split == "train" else "validation"
-        hf_dataset = hf_load("scene_parse_150", split=hf_split)
-        return HFSegmentationDataset(hf_dataset, transform=transform)
-    except Exception as e:
-        logger.warning(f"Failed to load Cityscapes from HuggingFace: {e}")
-        # Create a small synthetic dataset for testing
-        logger.info("Creating synthetic segmentation dataset for testing")
-        return SyntheticSegDataset(size=200, num_classes=19, image_size=512)
+    logger.warning(
+        "No local Cityscapes data found. "
+        "For real segmentation evaluation run experiments/run_segmentation.py "
+        "(uses ADE20K, no license required). "
+        "Falling back to synthetic data."
+    )
+    return SyntheticSegDataset(size=200, num_classes=19, image_size=512)
 
 
 def _load_cifar100(split: str, transform) -> Dataset:
@@ -334,6 +349,77 @@ class HFSegmentationDataset(Dataset):
             annotation = torch.zeros(1, dtype=torch.long)
 
         return image, annotation
+
+
+class CityscapesTrainIdDataset(Dataset):
+    """
+    Wraps torchvision.Cityscapes to convert raw label IDs (0-33) → training IDs (0-18).
+
+    torchvision.Cityscapes with target_type="semantic" returns the raw Cityscapes
+    label pixel values (0-33 for 34 categories), NOT the training IDs (0-18 for the
+    19 evaluation categories). The SegFormer and other models trained on Cityscapes
+    expect training IDs. Without this conversion, mean accuracy ≈ 1/19 because only
+    label IDs 0-18 pass the `target < num_classes` filter, and those IDs do not
+    correspond to the model's output class space.
+
+    Mapping source: https://github.com/mcordts/cityscapesScripts
+    """
+
+    # Maps Cityscapes label ID → training ID (255 = ignore)
+    LABEL_TO_TRAINID = {
+        0: 255, 1: 255, 2: 255, 3: 255, 4: 255,
+        5: 255, 6: 255,
+        7: 0,   # road
+        8: 1,   # sidewalk
+        9: 255, 10: 255,
+        11: 2,  # building
+        12: 3,  # wall
+        13: 4,  # fence
+        14: 255, 15: 255, 16: 255,
+        17: 5,  # pole
+        18: 255,
+        19: 6,  # traffic light
+        20: 7,  # traffic sign
+        21: 8,  # vegetation
+        22: 9,  # terrain
+        23: 10, # sky
+        24: 11, # person
+        25: 12, # rider
+        26: 13, # car
+        27: 14, # truck
+        28: 15, # bus
+        29: 255, 30: 255,
+        31: 16, # train
+        32: 17, # motorcycle
+        33: 18, # bicycle
+    }
+    _LUT = None
+
+    @classmethod
+    def _get_lut(cls):
+        if cls._LUT is None:
+            lut = torch.full((256,), 255, dtype=torch.long)
+            for label_id, train_id in cls.LABEL_TO_TRAINID.items():
+                lut[label_id] = train_id
+            cls._LUT = lut
+        return cls._LUT
+
+    def __init__(self, base_dataset: Dataset):
+        self.base = base_dataset
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        image, target = self.base[idx]
+        # target is a PIL Image with label IDs; convert to tensor then remap
+        if not isinstance(target, torch.Tensor):
+            target = torch.tensor(np.array(target), dtype=torch.long)
+        lut = self._get_lut()
+        # Clamp to valid LUT range then index
+        target_clamped = target.clamp(0, 255)
+        target_train = lut[target_clamped]
+        return image, target_train
 
 
 class SyntheticSegDataset(Dataset):

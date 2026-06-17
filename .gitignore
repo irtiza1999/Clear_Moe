@@ -60,11 +60,7 @@ htmlcov/
 *.blg
 *.lof
 *.lot
-
-# Node/npm
-node_modules/
-npm-debug.log
-package-lock.json
+texput.log
 
 # OS
 .DS_Store
@@ -75,10 +71,9 @@ Thumbs.db
 
 # Local development
 .pytest_cache/
-*.log
 debug_logs/
 
-# Large data files (keep configs but ignore dataset contents)
+# Large data files
 data/*
 !data/.gitkeep
 !data/README.md
@@ -93,38 +88,21 @@ stage*.log
 *.e*
 *.o*
 
-# Generated outputs (results can be re-run if needed)
-outputs/*.json
-outputs/ablations/
-outputs/benchmark_parallelism/
-outputs/cpu_vs_gpu/
-outputs/eda_full/
-outputs/eda_preprocess/
-outputs/extended_cpu_gpu/
-outputs/extended_parallelism/
-outputs/full_runs/
-outputs/hmoe_*/
-outputs/logs/
-outputs/novelty_comparison/
-outputs/parallel_scaling/
-outputs/roofline/
-outputs/soft_elastic_*/
-outputs/triton_dispatch/
+# Generated outputs (regenerable from experiments/)
+outputs/
 
-# Keep only important outputs
-!outputs/README.md
-!outputs/.gitkeep
-
-# Runtime/build artifacts
-runtime/__pycache__/
-runtime/*.pyc
+# Generated PDF artifacts
+main.pdf
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# Report writing (do not add to Git)
-report_writing/
+# Claude Code local settings
+.claude/
+
+# Planning documents
+CLEAR_MoE_Conference_Improvement_Plan.md
 
 # System
 .git/
